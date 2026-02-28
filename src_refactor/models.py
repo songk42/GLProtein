@@ -1,0 +1,1127 @@
+from math import gamma
+import os
+import json
+import copy
+from typing import Optional, Tuple, Union
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass
+from torch.nn.utils.weight_norm import weight_norm
+from torch import nn
+from torch.nn import CrossEntropyLoss
+from torch.nn.modules.sparse import Embedding
+from transformers import PreTrainedModel, AutoConfig, PretrainedConfig,BertPreTrainedModel, BertModel,T5EncoderModel, T5Tokenizer,T5Config,T5PreTrainedModel, BertConfig
+from transformers.models.bert.modeling_bert import BertEmbeddings, BertEncoder
+# from .tm_vec.embed_structure_model import trans_basic_block, trans_basic_block_Config
+# from .tm_vec.tm_vec_utils import featurize_prottrans, embed_tm_vec, encode
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPastAndCrossAttentions,
+    Seq2SeqLMOutput,
+    Seq2SeqModelOutput,
+)
+from transformers.models.t5.modeling_t5 import T5Stack
+from transformers.models.bert.modeling_bert import BertOnlyMLMHead
+from transformers.file_utils import ModelOutput
+from transformers.utils import logging
+# from transformers.deepspeed import is_deepspeed_zero3_enabled
+# from deepspeed import DeepSpeedEngine
+from transformers import DistilBertConfig, BertForMaskedLM
+from transformers import pipeline
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, List
+# from decoder import KnowledgeBertModel
+from src_refactor.decoder import KnowledgeBertModel
+import warnings
+from transformers import T5PreTrainedModel,T5Config
+from transformers.models.t5.modeling_t5 import T5Stack, T5LayerNorm, T5LayerFF, T5Attention, T5LayerSelfAttention, T5LayerCrossAttention, T5LayerFF
+# from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+
+# import logging
+
+logger = logging.get_logger('pretrain_log')
+# logger = logging.getLogger("pretrain")
+
+
+DECODER_CONFIG_NAME = "config.json"
+PROTEIN_CONFIG_NAME = "config.json"
+PROTEIN_MODEL_STATE_DICT_NAME = 'pytorch_model.bin'
+DECODER_MODEL_STATE_DICT_NAME = 'pytorch_model.bin'
+
+
+__HEAD_MASK_WARNING_MSG = """
+The input argument `head_mask` was split into two arguments `head_mask` and `decoder_head_mask`. Currently,
+`decoder_head_mask` is set to copy `head_mask`, but this feature is deprecated and will be removed in future versions.
+If you do not want to use any `decoder_head_mask` now, please set `decoder_head_mask = torch.ones(num_layers,
+num_heads)`.
+"""
+class T5ForConditionalGeneration(T5PreTrainedModel):
+    _keys_to_ignore_on_load_unexpected = [
+        "decoder.block.0.layer.1.EncDecAttention.relative_attention_bias.weight",
+    ]
+    _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight"]
+
+    def __init__(self, config: T5Config):
+        super().__init__(config)
+        self.model_dim = config.d_model
+
+        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.use_cache = False
+        encoder_config.is_encoder_decoder = False
+        self.encoder = T5Stack(encoder_config, self.shared)
+
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        decoder_config.num_layers = config.num_decoder_layers
+        self.decoder = T5Stack(decoder_config, self.shared)
+
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
+
+    def parallelize(self, device_map=None):
+        warnings.warn(
+            "`T5ForConditionalGeneration.parallelize` is deprecated and will be removed in v5 of Transformers, you"
+            " should load your model with `device_map='balanced'` in the call to `from_pretrained`. You can also"
+            " provide your own `device_map` but it needs to be a dictionary module_name to device, so for instance"
+            " {'encoder.block.0': 0, 'encoder.block.1': 1, ...}",
+            FutureWarning,
+        )
+        self.device_map = (
+            get_device_map(len(self.encoder.block), range(torch.cuda.device_count()))
+            if device_map is None
+            else device_map
+        )
+        assert_device_map(self.device_map, len(self.encoder.block))
+        self.encoder.parallelize(self.device_map)
+        self.decoder.parallelize(self.device_map)
+        self.lm_head = self.lm_head.to(self.decoder.first_device)
+        self.model_parallel = True
+
+
+    def deparallelize(self):
+        warnings.warn(
+            "Like `parallelize`, `deparallelize` is deprecated and will be removed in v5 of Transformers.",
+            FutureWarning,
+        )
+        self.encoder.deparallelize()
+        self.decoder.deparallelize()
+        self.encoder = self.encoder.to("cpu")
+        self.decoder = self.decoder.to("cpu")
+        self.lm_head = self.lm_head.to("cpu")
+        self.model_parallel = False
+        self.device_map = None
+        torch.cuda.empty_cache()
+
+    def get_input_embeddings(self):
+        return self.shared
+
+    def set_input_embeddings(self, new_embeddings):
+        self.shared = new_embeddings
+        self.encoder.set_input_embeddings(new_embeddings)
+        self.decoder.set_input_embeddings(new_embeddings)
+
+    def _tie_weights(self):
+        if self.config.tie_word_embeddings:
+            self._tie_or_clone_weights(self.encoder.embed_tokens, self.shared)
+            self._tie_or_clone_weights(self.decoder.embed_tokens, self.shared)
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def get_encoder(self):
+        return self.encoder
+
+    def get_decoder(self):
+        return self.decoder
+
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        decoder_head_mask: Optional[torch.FloatTensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[-100, 0, ...,
+            config.vocab_size - 1]`. All labels set to `-100` are ignored (masked), the loss is only computed for
+            labels in `[0, ..., config.vocab_size]`
+
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> from transformers import AutoTokenizer, T5ForConditionalGeneration
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
+        >>> model = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+
+        >>> # training
+        >>> input_ids = tokenizer("The <extra_id_0> walks in <extra_id_1> park", return_tensors="pt").input_ids
+        >>> labels = tokenizer("<extra_id_0> cute dog <extra_id_1> the <extra_id_2>", return_tensors="pt").input_ids
+        >>> outputs = model(input_ids=input_ids, labels=labels)
+        >>> loss = outputs.loss
+        >>> logits = outputs.logits
+
+        >>> # inference
+        >>> input_ids = tokenizer(
+        ...     "summarize: studies have shown that owning a dog is good for you", return_tensors="pt"
+        ... ).input_ids  # Batch size 1
+        >>> outputs = model.generate(input_ids)
+        >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+        >>> # studies have shown that owning a dog is good for you.
+        ```"""
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
+        if head_mask is not None and decoder_head_mask is None:
+            if self.config.num_layers == self.config.num_decoder_layers:
+                warnings.warn(__HEAD_MASK_WARNING_MSG, FutureWarning)
+                decoder_head_mask = head_mask
+
+        # Encode if needed (training, first prediction pass)
+        if encoder_outputs is None:
+            # Convert encoder inputs in embeddings if needed
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+            )
+
+        hidden_states = encoder_outputs[0]
+
+        if self.model_parallel:
+            torch.cuda.set_device(self.decoder.first_device)
+
+        if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+            # get decoder inputs from shifting lm labels to the right
+            decoder_input_ids = self._shift_right(labels)
+
+        # Set device for model parallelism
+        if self.model_parallel:
+            torch.cuda.set_device(self.decoder.first_device)
+            hidden_states = hidden_states.to(self.decoder.first_device)
+            if decoder_input_ids is not None:
+                decoder_input_ids = decoder_input_ids.to(self.decoder.first_device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.decoder.first_device)
+            if decoder_attention_mask is not None:
+                decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
+
+        # Decode
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            inputs_embeds=decoder_inputs_embeds,
+            past_key_values=past_key_values,
+            encoder_hidden_states=hidden_states,
+            encoder_attention_mask=attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = decoder_outputs[0]
+
+        # Set device for model parallelism
+        if self.model_parallel:
+            torch.cuda.set_device(self.encoder.first_device)
+            self.lm_head = self.lm_head.to(self.encoder.first_device)
+            sequence_output = sequence_output.to(self.lm_head.weight.device)
+
+        if self.config.tie_word_embeddings:
+            # Rescale output before projecting on vocab
+            # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
+            sequence_output = sequence_output * (self.model_dim**-0.5)
+
+        lm_logits = self.lm_head(sequence_output)
+
+        loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss(ignore_index=-100)
+            # move labels to correct device to enable PP
+            labels = labels.to(lm_logits.device)
+            loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+            # TODO(thom): Add z_loss https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L666
+
+        if not return_dict:
+            output = (lm_logits,) + decoder_outputs[1:] + encoder_outputs
+            return ((loss,) + output) if loss is not None else output
+
+        return Seq2SeqLMOutput(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        decoder_attention_mask=None,
+        cross_attn_head_mask=None,
+        use_cache=None,
+        encoder_outputs=None,
+        **kwargs,
+    ):
+        # cut decoder_input_ids if past_key_values is used
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].shape[2]
+
+            # Some generation methods already pass only the last input ID
+            if input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
+            else:
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = input_ids.shape[1] - 1
+
+            input_ids = input_ids[:, remove_prefix_length:]
+
+        return {
+            "decoder_input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "encoder_outputs": encoder_outputs,
+            "attention_mask": attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "decoder_attention_mask": decoder_attention_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "use_cache": use_cache,
+        }
+
+    def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
+        return self._shift_right(labels)
+
+    def _reorder_cache(self, past_key_values, beam_idx):
+        # if decoder past is not included in output
+        # speedy decoding is disabled and no need to reorder
+        if past_key_values is None:
+            logger.warning("You might want to consider setting `use_cache=True` to speed up decoding")
+            return past_key_values
+
+        reordered_decoder_past = ()
+        for layer_past_states in past_key_values:
+            # get the correct batch idx from layer past batch dim
+            # batch dim of `past` is at 2nd position
+            reordered_layer_past_states = ()
+            for layer_past_state in layer_past_states:
+                # need to set correct `past` for each of the four key / value states
+                reordered_layer_past_states = reordered_layer_past_states + (
+                    layer_past_state.index_select(0, beam_idx.to(layer_past_state.device)),
+                )
+
+            if reordered_layer_past_states[0].shape != layer_past_states[0].shape:
+                raise ValueError(
+                    f"reordered_layer_past_states[0] shape {reordered_layer_past_states[0].shape} and layer_past_states[0] shape {layer_past_states[0].shape} mismatched"
+                )
+            if len(reordered_layer_past_states) != len(layer_past_states):
+                raise ValueError(
+                    f"length of reordered_layer_past_states {len(reordered_layer_past_states)} and length of layer_past_states {len(layer_past_states)} mismatched"
+                )
+
+            reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
+        return reordered_decoder_past
+
+
+@torch.jit.script
+def gaussian(x, mean, std):
+    pi = 3.14159
+    a = (2*pi) ** 0.5
+    return torch.exp(-0.5 * (((x - mean) / std) ** 2)) / (a * std)
+
+class GaussianLayer(nn.Module):
+    def __init__(self, K=128, edge_types=2):
+        super().__init__()
+        self.K = K
+        self.means = nn.Embedding(1, K)
+        self.stds = nn.Embedding(1, K)
+        self.mul = nn.Embedding(edge_types, 1, padding_idx=0)
+        self.bias = nn.Embedding(edge_types, 1, padding_idx=0)
+        nn.init.uniform_(self.means.weight, 0, 3)
+        nn.init.uniform_(self.stds.weight, 0, 3)
+        nn.init.constant_(self.bias.weight, 0)
+        nn.init.constant_(self.mul.weight, 1)
+
+    def forward(self, x, edge_types):
+        mul = self.mul(edge_types).sum(dim=-2)
+        bias = self.bias(edge_types).sum(dim=-2)
+        x = mul * x.unsqueeze(-1) + bias
+        x = x.expand(-1, -1, -1, self.K)
+        mean = self.means.weight.float().view(-1)
+        std = self.stds.weight.float().view(-1).abs() + 1e-2
+        return gaussian(x.float(), mean, std).type_as(self.means.weight)
+
+class NonLinear(nn.Module):
+    def __init__(self, input, output_size, hidden=None):
+        super(NonLinear, self).__init__()
+
+        if hidden is None:
+            hidden = input
+        self.layer1 = nn.Linear(input, hidden)
+        self.layer2 = nn.Linear(hidden, output_size)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = F.gelu(x)
+        x = self.layer2(x)
+        return x
+
+# class Protein3DBias(nn.Module):
+#     """
+#         Compute 3D attention bias according to the position information for each head.
+#         """
+
+#     def __init__(self):
+#         super(Protein3DBias, self).__init__()
+#         self.num_heads = 8
+#         self.num_edges = 2
+#         self.num_kernel = 128
+#         self.embed_dim = 512
+
+
+#         rpe_heads = self.num_heads
+#         self.gbf = GaussianLayer(self.num_kernel, self.num_edges)
+#         self.gbf_proj = NonLinear(self.num_kernel, rpe_heads)
+
+#         if self.num_kernel != self.embed_dim:
+#             self.edge_proj = nn.Linear(self.num_kernel, self.embed_dim)
+#         else:
+#             self.edge_proj = None
+
+#     def forward(self, batched_data):
+
+#         pos, x, node_type_edge = batched_data['protein_coordinates'], batched_data['protein_input_ids'], batched_data['protein_token_type_ids'] # pos shape: [n_examoles, n_nodes, 3]
+#         # pos.requires_grad_(True)
+
+#         padding_mask = x.eq(0).all(dim=-1)
+#         n_graph, n_node, _ = pos.shape
+#         delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
+#         dist = delta_pos.norm(dim=-1).view(-1, n_node, n_node)
+#         delta_pos /= dist.unsqueeze(-1) + 1e-5
+
+#         edge_feature = self.gbf(dist, torch.zeros_like(dist).long() if node_type_edge is None else node_type_edge.long())
+#         gbf_result = self.gbf_proj(edge_feature)
+#         graph_attn_bias = gbf_result
+
+#         graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+#         graph_attn_bias.masked_fill_(
+#             padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
+#         )
+
+#         edge_feature = edge_feature.masked_fill(
+#             padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool), 0.0
+#         )
+
+#         sum_edge_features = edge_feature.sum(dim=-2)
+#         merge_edge_features = self.edge_proj(sum_edge_features)
+
+#         return graph_attn_bias, merge_edge_features, delta_pos
+
+
+
+
+# class SimpleMLP(nn.Module):
+#     def __init__(self,
+#                  in_dim: int,
+#                  hid_dim: int,
+#                  out_dim: int,
+#                  dropout: float = 0.):
+#         super().__init__()
+#         self.main = nn.Sequential(
+#             weight_norm(nn.Linear(in_dim, hid_dim), dim=None),
+#             nn.ReLU(),
+#             nn.Dropout(dropout, inplace=True),
+#             weight_norm(nn.Linear(hid_dim, out_dim), dim=None)
+#         )
+
+#     def forward(self, x):
+#         return self.main(x)
+
+class GLProteinConfig:
+    """
+    contains configs for the decoder, and configs for the 
+    """
+    def __init__(self,**kwargs):
+        self.use_desc = kwargs.pop('use_desc', True)
+        self.num_relations = kwargs.pop('num_relations', None)
+        self.num_go_terms = kwargs.pop('num_go_terms', None)
+        self.num_proteins = kwargs.pop('num_proteins', None)
+
+
+        self.protein_encoder_cls = kwargs.pop('protein_encoder_cls', None)
+        self.go_encoder_cls = kwargs.pop('go_encoder_cls', None)
+
+        #         config.decoder_config.use_desc = self.use_desc
+        # config.decoder_config.use_desc = self.num_relations
+        # config.decoder_config.use_desc = self.num_go_terms
+        # config.decoder_config.use_desc = self.num_proteins
+        # config.decoder_config.use_desc = self.protein_encoder_cls
+        # config.decoder_config.use_desc = self.go_encoder_cls
+
+
+        self.protein_model_config = None
+        self.decoder_config = None
+
+    def save_to_json_file(self, encoder_save_directory: os.PathLike):
+        os.makedirs(encoder_save_directory, exist_ok=True)
+        # os.makedirs(decoder_save_directory, exist_ok=True)
+
+        self.protein_model_config.save_pretrained(encoder_save_directory)
+        # self.decoder_config.save_pretrained(decoder_save_directory)
+
+        logger.info(f'Encoder Configuration saved in {encoder_save_directory}')
+        # logger.info(f'Decoder Configuration saved in {decoder_save_directory}')
+
+    @classmethod
+    def from_json_file(cls, encoder_config_path: os.PathLike, decoder_config_path: os.PathLike):
+        config = cls()
+        config.protein_model_config = BertConfig.from_pretrained(encoder_config_path)
+        config.decoder_config = AutoConfig.from_pretrained(decoder_config_path)
+
+        return config
+
+@dataclass
+class MaskedLMOutput(ModelOutput):
+    """
+    Base class for masked language models outputs.
+
+    Args:
+        loss (:obj:`torch.FloatTensor` of shape :obj:`(1,)`, `optional`, returned when :obj:`labels` is provided):
+            Masked language modeling (MLM) loss.
+        logits (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        hidden_states (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_hidden_states=True`` is passed or when ``config.output_hidden_states=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer)
+            of shape :obj:`(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        attentions (:obj:`tuple(torch.FloatTensor)`, `optional`, returned when ``output_attentions=True`` is passed or when ``config.output_attentions=True``):
+            Tuple of :obj:`torch.FloatTensor` (one for each layer) of shape :obj:`(batch_size, num_heads,
+            sequence_length, sequence_length)`.
+
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    pooler_output: Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class MaskedLMAndPFIOutput(ModelOutput):
+
+    mlm_loss: Optional[torch.FloatTensor] = None
+    mlm_logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    encoder_attention: Optional[Tuple[torch.FloatTensor]] = None
+    go_attention: Optional[Tuple[torch.FloatTensor]] = None
+    pooler_output: Optional[torch.FloatTensor] = None
+    pos_pfi_logits: Optional[torch.FloatTensor] = None
+    neg_pfi_logits: Optional[torch.FloatTensor] = None
+
+
+# only use the last layer----- we can try using other layers
+class BertPooler(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.activation = nn.Tanh()
+
+    def forward(self, hidden_states):
+        # attention_mask = attention_mask.bool()
+        # num_batch_size = attention_mask.size(0)
+        # pooled_output = torch.stack([hidden_states[i, attention_mask[i, :], :].mean(dim=0) for i in range(num_batch_size)], dim=0)
+        pooled_output = hidden_states[:, 0]
+        pooled_output = self.dense(pooled_output)
+        return pooled_output
+
+
+
+
+
+class KnowledgeDecoder(BertPreTrainedModel):
+# class KnowledgeDecoder(T5EncoderModel):
+    """
+    Implementation of the full GLProtein decoder
+    """
+
+    def __init__(self,decoder_config=None):
+        super().__init__(decoder_config)
+
+        # textbert for relation and GO feature extraction, all param.requires_grad = False
+        textbert_config = AutoConfig.from_pretrained(decoder_config.text_model_path)
+        self.textbert = BertModel.from_pretrained(decoder_config.text_model_path, output_hidden_states=True)
+        for param in self.textbert.parameters():
+            param.requires_grad = False
+
+
+        # decoder
+        self.config = decoder_config
+        self.decoder = KnowledgeBertModel(decoder_config,add_pooling_layer=False)
+
+        # linear layer to project features into the same dimension
+        self.go_project = nn.Linear(textbert_config.hidden_size, self.config.hidden_size)
+        self.relation_project = nn.Linear(textbert_config.hidden_size, self.config.hidden_size)
+        
+        self.coordinate_project = nn.Linear(3, self.config.hidden_size)
+        self.aa_vec_project = nn.Linear(300, self.config.hidden_size)
+
+        self.gbf = GaussianLayer(128, 1)
+        self.gbf_proj = NonLinear(128, 512, 1024)
+
+        self.text_feat_dim = textbert_config.hidden_size
+        self.text_pooler = BertPooler(textbert_config)
+
+        # mlm head and pooler
+        self.mlm_cls = BertOnlyMLMHead(self.config)
+        self.pooler = BertPooler(self.config)
+
+        # pfi head, requires pooled outputs
+        if decoder_config.use_pfi:
+            self.pfi_cls = nn.Sequential(nn.Linear(self.config.hidden_size, 2), nn.Softmax(dim=-1))
+      
+    def forward(self, 
+        # relation_inputs,
+        # go_inputs,
+        relation_inputs=None,
+        go_inputs=None,
+        inputs_embeds=None,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        return_mlm=True,
+        coordinate_inputs=None,
+        aa_vec_inputs = None):
+        batch, protein_len, protein_embed_size = inputs_embeds.size()
+
+        ### coordinate feature extraction
+
+
+        # coordinate_input,coordinate_attention_mask = coordinate_inputs 
+        # aa_vec_input,aa_vec_attention_mask = aa_vec_inputs
+
+
+        # #get the coordinate mask
+        # coordinate_attention_mask = torch.mean(coordinate_input,dim=2)
+        # coordinate_attention_mask = torch.where(torch.isinf(coordinate_attention_mask),torch.zeros_like(coordinate_attention_mask),coordinate_attention_mask)
+        # coordinate_attention_mask = torch.where(torch.isnan(coordinate_attention_mask),torch.zeros_like(coordinate_attention_mask),coordinate_attention_mask)
+        # coordinate_attention_mask = coordinate_attention_mask.bool()
+
+        # delta_pos = coordinate_input.unsqueeze(1) - coordinate_input.unsqueeze(2)
+        # dist = delta_pos.norm(dim=-1).view(-1, protein_len-2, protein_len-2)
+        # delta_pos /= dist.unsqueeze(-1) + 1e-5
+        
+        # delta_pos = torch.where(torch.isinf(delta_pos),torch.zeros_like(delta_pos),delta_pos)
+        # delta_pos = torch.where(torch.isnan(delta_pos),torch.zeros_like(delta_pos),delta_pos)
+        # delta_pos = torch.mean(delta_pos,dim=2)
+        # coordinate_feat = self.coordinate_project(delta_pos) #(batch,coordinate len, decoder hidden dim)
+        
+        
+        # aa_vec_attention_mask = coordinate_attention_mask
+
+
+        # aa_vec_feat = self.aa_vec_project(aa_vec_input) #(batch,aa_vec len, decoder hidden dim)
+
+        
+        # go_input_ids, go_attention_mask, go_token_type_ids = go_inputs
+        
+
+        # go_out = self.textbert(go_input_ids,
+        #                             attention_mask=go_attention_mask,
+        #                             token_type_ids=go_token_type_ids,
+        #                             output_hidden_states=True,
+        #                             return_dict=True) # (batch,token len, feat_dim)  
+
+        # # hidden size (b,seqlen, 768)
+        # go_feat = torch.cat(tuple([go_out.hidden_states[i].unsqueeze(1) for i in [-4, -3, -2, -1]]), dim=1) # (b ,4, go len, hidden_dim)
+        # go_feat = torch.mean(go_feat,dim=1) # (b,go len, hidden_dim)
+
+        # go_feat = self.go_project(go_feat) #(batch,, go len, decoder hidden dim)
+
+
+        # ### relation feature extraction
+        # relation_input_ids, relation_attention_mask, relation_token_type_ids = relation_inputs
+        # relation_out = self.textbert(relation_input_ids,
+        #                             attention_mask=relation_attention_mask,
+        #                             token_type_ids=relation_token_type_ids,
+        #                             output_hidden_states=True,
+        #                             return_dict=True) # (batch,token len, feat_dim)
+
+
+        # relation_feat = torch.cat(tuple([relation_out.hidden_states[i].unsqueeze(1) for i in [-4, -3, -2, -1]]), dim=1) # (b ,4,relation len, hidden_dim)
+
+        # relation_feat = torch.mean(relation_feat,dim=1) # (b,relation len, hidden_dim)
+
+        # relation_feat = self.relation_project(relation_feat) #(batch,relation len, decoder hidden dim)'
+        
+
+
+        #HACK
+        ## input embedding to decoder, mask stay the same as protbert
+        out = self.decoder(inputs_embeds=inputs_embeds,
+            input_ids=None,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            # relation_hidden_states=relation_feat,
+            # relation_attention_mask=relation_attention_mask,
+            # go_hidden_states=go_feat,
+            # go_attention_mask=go_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            # coordinate_hidden_states= coordinate_feat,
+            # coordinate_attention_mask= coordinate_attention_mask,
+            # aa_vec_hidden_states = aa_vec_feat,
+            # aa_vec_attention_mask = aa_vec_attention_mask,
+        )
+
+
+        # # output_seq = out.hidden_states[-1]
+        output_seq = out[0] # last hidden layer
+
+        # output_seq = inputs_embeds # pretrain for nothing attention
+
+        mlm_prediction_scores = self.mlm_cls(output_seq)
+
+        # pfi output
+        pooler_output = self.pooler(output_seq)
+        pfi_prediction=None
+        if self.config.use_pfi:
+            pfi_prediction = self.pfi_cls(pooler_output)
+
+        out.pooler_output = pooler_output
+
+        return (out,mlm_prediction_scores,pfi_prediction)
+
+
+
+
+class GLProtein(nn.Module):
+    """
+    Implementation of the GLProtein model
+    """
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.encoder_config = config.protein_model_config
+        self.decoder_config = config.decoder_config
+        self.encoder=BertModel(self.encoder_config, add_pooling_layer=False)
+        self.decoder = None
+
+        
+        
+
+      
+        
+
+    def forward(self,
+        protein_inputs: Tuple = None,
+        pos_relation_inputs: Union[torch.Tensor, Tuple] = None,
+        pos_go_tail_inputs: Union[torch.Tensor, Tuple] = None,
+        neg_relation_inputs: Union[torch.Tensor, Tuple] = None,
+        neg_go_tail_inputs: Union[torch.Tensor, Tuple] = None,
+        use_pfi: bool = True,
+        output_attentions: bool = False
+        ):
+
+      
+
+        # protein_input_ids, protein_attention_mask, protein_token_type_ids, protein_coordinates,coordinate_attention_mask, aa_vec, aa_vec_attention_mask= protein_inputs
+        protein_input_ids = protein_inputs["input_ids"]
+        protein_attention_mask = protein_inputs["attention_mask"]
+        protein_token_type_ids = protein_inputs["token_type_ids"]
+
+        # coordinate_inputs = (protein_coordinates,coordinate_attention_mask)
+        # aa_vec_inputs = (aa_vec,aa_vec_attention_mask)
+
+       
+
+        # protein_outputs = self.encoder(
+        #     input_ids=protein_input_ids,
+        #     attention_mask=protein_attention_mask,
+        #     token_type_ids=protein_token_type_ids,
+        #     output_hidden_states=True,
+        #     return_dict=True,
+        #     output_attentions=output_attentions
+        # )
+
+        protein_outputs = self.encoder(
+            input_ids=protein_input_ids,
+            attention_mask=protein_attention_mask,
+            token_type_ids=protein_token_type_ids,
+            output_hidden_states=True,
+            return_dict=True,
+            output_attentions=output_attentions
+        )
+
+
+        prot_seq_embed = protein_outputs[0] 
+
+
+        out, mlm_prediction_scores, pos_pfi_prediction = self.decoder(inputs_embeds=prot_seq_embed,
+            attention_mask=protein_attention_mask,
+            token_type_ids=protein_token_type_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        
+        # out, mlm_prediction_scores, pos_pfi_prediction = self.decoder(pos_relation_inputs, pos_go_tail_inputs,inputs_embeds=prot_seq_embed,
+        #     attention_mask=protein_attention_mask,
+        #     token_type_ids=protein_token_type_ids,
+        #     output_hidden_states=True,
+        #     return_dict=True,
+        #     output_attentions=output_attentions,
+        #     coordinate_inputs = coordinate_inputs,
+        #     input_ids = protein_input_ids,
+        #     aa_vec_inputs = aa_vec_inputs,
+        #     )
+
+        neg_pfi_prediction=None
+        if use_pfi:
+            out_neg, neg_mlm_prediction_scores, neg_pfi_prediction = self.decoder(neg_relation_inputs, neg_go_tail_inputs,inputs_embeds=prot_seq_embed,
+            attention_mask=protein_attention_mask,
+            token_type_ids=protein_token_type_ids,
+            output_hidden_states=True,
+            return_dict=True,
+            output_attentions=output_attentions,
+            coordinate_inputs = coordinate_inputs,
+            input_ids = protein_input_ids
+            )
+
+
+        return MaskedLMAndPFIOutput(
+            mlm_loss=None,
+            mlm_logits=mlm_prediction_scores,
+            hidden_states=out.hidden_states,
+            encoder_attention=protein_outputs.attentions,
+            go_attention=out.attentions,
+            pooler_output=out.pooler_output,
+            pos_pfi_logits=pos_pfi_prediction,
+            neg_pfi_logits=neg_pfi_prediction
+        )
+
+
+    def save_pretrained(self,save_directory: os.PathLike,state_dict: Optional[dict] = None,save_config: bool = True,
+    ):
+        encoder_save_directory = os.path.join(save_directory, 'encoder')
+        # decoder_save_directory = os.path.join(save_directory, 'decoder')
+
+        self.encoder.save_pretrained(encoder_save_directory, save_config=save_config)
+        # self.decoder.save_pretrained(decoder_save_directory, save_config=save_config)
+
+        logger.info(f'Encoder Model weights saved in {encoder_save_directory}')
+        # logger.info(f'Decoder Model weights saved in {decoder_save_directory}')
+
+    @classmethod
+    def from_pretrained(
+        cls, 
+        protein_model_path: os.PathLike, 
+        text_model_path: os.PathLike,
+        decoder_model_path: os.PathLike,
+        model_args = None,
+        training_args = None,
+        **kwargs
+    ):
+
+        # Will feed the number of relations and entity.
+        num_relations = kwargs.pop('num_relations', None)
+        num_go_terms = kwargs.pop('num_go_terms', None)
+        num_proteins = kwargs.pop('num_proteins', None)
+
+        # 1 assign useful configs to decoder config
+        kmae_config = GLProteinConfig.from_json_file(protein_model_path, decoder_model_path)
+        kmae_config.decoder_config.num_relations=num_relations,
+        kmae_config.decoder_config.num_go_terms=num_go_terms,
+        kmae_config.decoder_config.num_proteins=num_proteins,
+        if training_args:
+            kmae_config.decoder_config.use_desc=training_args.use_desc,
+            kmae_config.decoder_config.use_pfi = training_args.use_pfi
+        if model_args:
+            kmae_config.decoder_config.go_encoder_cls=model_args.go_encoder_cls,
+            kmae_config.decoder_config.protein_encoder_cls=model_args.protein_encoder_cls
+
+        kmae_config.decoder_config.text_model_path = text_model_path
+        
+        # instantiate model. Note textbert in decoder is initialized in this step
+        kmae_model = cls(config=kmae_config)
+
+        # 2 load encoder model
+        if kmae_model.decoder_config.protein_encoder_cls == 'bert':
+            kmae_model.encoder = BertModel.from_pretrained(protein_model_path)
+        else:
+            raise NotImplementedError("Currently only support bert for encoder")
+
+        # 3 load decoder model
+        if kmae_model.decoder_config.model_type == 'bert':
+            # if decoder state dict exists load decoder
+            if os.path.exists(os.path.join(decoder_model_path,'pytorch_model.bin')):
+                logger.info(f'Loading Decoder Model from {decoder_model_path}')
+                kmae_model.decoder = KnowledgeDecoder.from_pretrained(decoder_model_path)
+            # if decoder state dict does not exists (first time training)
+            else:
+                kmae_model.decoder = KnowledgeDecoder(kmae_config.decoder_config)
+        else:
+            raise NotImplementedError("Currently only support bert cls")
+        
+        kmae_model.eval()
+
+        return kmae_model
+
+@dataclass
+class GLProteinLoss:
+    """
+     Perform forward propagation and return loss for protein function inference
+
+    for pfi task (default don't use):
+        pfi_weight: weight of protein function inference loss
+        num_protein_go_neg_sample: number of negative samples per positive sample  
+    """
+    def __init__(self,pfi_weight=1.0,num_protein_go_neg_sample=1,mlm_lambda=1.0):
+        self.pfi_weight = pfi_weight
+        self.mlm_lambda = mlm_lambda
+        self.num_protein_go_neg_sample = num_protein_go_neg_sample
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def __call__(
+        self,
+        model: BertModel,
+        use_desc: bool = False,
+        use_seq: bool = True,
+        use_pfi: bool = True,
+        protein_go_inputs = None,
+        protein_seq_inputs = None,
+        **kwargs
+    ):
+        # get protein inputs
+        # protein_mlm_input_ids = protein_go_inputs['protein_input_ids']
+        # protein_mlm_attention_mask = protein_go_inputs['protein_attention_mask']
+        # protein_mlm_token_type_ids = protein_go_inputs['protein_token_type_ids']
+        # protein_mlm_pos_embed = protein_go_inputs['protein_coordinates']  # add coordinates here
+        # coordinate_attenion_mask = protein_go_inputs['coordinate_attention_mask']
+        # protein_mlm_aa_vec_embed = protein_go_inputs['aa_vec']  # add aa_vec here
+        # aa_vec_attention_mask= protein_go_inputs['aa_vec_attention_mask']
+
+
+
+        # protein_input = (protein_mlm_input_ids,protein_mlm_attention_mask,protein_mlm_token_type_ids, protein_mlm_pos_embed,coordinate_attenion_mask,protein_mlm_aa_vec_embed, aa_vec_attention_mask)  # add coordinates here
+        # # coordinate_input = (protein_mlm_pos_embed,coordinate_attenion_mask)
+
+        # protein_mlm_labels = protein_go_inputs['protein_labels']
+
+        # # relation inputs
+        # relation_ids = protein_go_inputs['relation_ids']
+        # relation_attention_mask = protein_go_inputs['relation_attention_mask']
+        # relation_token_type_ids = protein_go_inputs['relation_token_type_ids']
+        # relation_inputs = (relation_ids, relation_attention_mask, relation_token_type_ids)
+ 
+
+        # ## positive inputs
+        # positive = protein_go_inputs['positive']
+
+        # # get tail inputs
+        # positive_tail_input_ids = positive['tail_input_ids']
+        # positive_tail_attention_mask = positive['tail_attention_mask']
+        # positive_tail_token_type_ids = positive['tail_token_type_ids']
+
+        # positive_go_tail_inputs = positive_tail_input_ids
+        # if use_desc:
+        #     positive_go_tail_inputs = (positive_tail_input_ids, positive_tail_attention_mask, positive_tail_token_type_ids)
+
+
+        # ## negative inputs
+        # negative_go_tail_inputs=None
+        # if use_pfi:
+        #     negative = protein_go_inputs['negative']
+
+        #     # get tail inputs
+        #     negative_tail_input_ids = negative['tail_input_ids']
+        #     negative_tail_attention_mask = negative['tail_attention_mask']
+        #     negative_tail_token_type_ids = negative['tail_token_type_ids']
+
+        #     negative_go_tail_inputs = negative_tail_input_ids
+        #     if use_desc:
+        #         negative_go_tail_inputs = (negative_tail_input_ids, negative_tail_attention_mask, negative_tail_token_type_ids)
+
+
+
+
+        # model_output = model(protein_mlm_input_ids['input_ids'].to('cuda'), labels =  protein_mlm_labels['input_ids'].to('cuda'))
+        model_output = model(protein_inputs=protein_seq_inputs, use_pfi=use_pfi)
+
+        # mlm loss
+        mlm_logits = model_output.mlm_logits
+        batch, seq_len, vocab_size = mlm_logits.size()
+        # mlm_loss = self.loss_fn(mlm_logits.view(-1, vocab_size), protein_mlm_labels.view(-1)) * self.mlm_lambda
+        # mlm_loss = model_output.mlm_loss * self.mlm_lambda
+        mlm_loss = self.loss_fn(mlm_logits.view(-1, vocab_size), protein_seq_inputs['labels'].view(-1)) * self.mlm_lambda
+
+        # pfi loss
+        pos_pfi_loss =0
+        neg_pfi_loss =0
+        if use_pfi:
+            pos_pfi_logits = model_output.pos_pfi_logits #(batch,2)
+            neg_pfi_logits = model_output.neg_pfi_logits
+   
+            pos_pfi_label = protein_go_inputs['pfi_pos'].repeat(pos_pfi_logits.size(0))
+            neg_pfi_label = protein_go_inputs['pfi_neg'].repeat(neg_pfi_logits.size(0))
+
+            pos_pfi_loss = self.loss_fn(pos_pfi_logits.view(-1, 2), pos_pfi_label.view(-1)) * self.pfi_weight
+            neg_pfi_loss = self.loss_fn(neg_pfi_logits.view(-1, 2), neg_pfi_label.view(-1)) * self.pfi_weight
+
+
+        # import ipdb; ipdb.set_trace() 
+
+        return(mlm_loss,pos_pfi_loss,neg_pfi_loss)
+
+                
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """
+    Recursively unwraps a model from potential containers (as used in distributed training).
+
+    Args:
+        model (:obj:`torch.nn.Module`): The model to unwrap.
+    """
+    # since there could be multiple levels of wrapping, unwrap recursively
+    if hasattr(model, "module"):
+        return unwrap_model(model.module)
+    else:
+        return model
+
+
+# performs pooling that do not considers pads efficiently, supports max,avg and summation
+def pool(h, mask, type='max'):
+    # h dim (batch,seq len, feat dim); mask dim(batch, seq len,1|feat dim)
+    if type == 'max':
+        h = h.masked_fill(mask, -1e12)
+        return torch.max(h, 1)[0]
+    elif type == 'avg':
+        h = h.masked_fill(mask, 0)
+        return h.sum(1) / (mask.size(1) - mask.float().sum(1))
+    else:
+        h = h.masked_fill(mask, 0)
+        return h.sum(1)
+
+def copy_layers(src_layers, dest_layers, layers_to_copy):
+    layers_to_copy = nn.ModuleList([src_layers[i] for i in layers_to_copy])
+    assert len(dest_layers) == len(layers_to_copy), f"{len(dest_layers)} != {len(layers_to_copy)}"
+    dest_layers.load_state_dict(layers_to_copy.state_dict())
+
+
+@dataclass
+class TMVecLoss:
+    """
+    Loss function for TMVec Embedding Similarity.
+
+    Args:
+        tmv_lambda: hyper-parameters to control the effect of MLM loss.
+    """
+    def __init__(self,tmv_lambda=1.0):
+        self.tmv_lambda = tmv_lambda
+        T5_encoder = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50")
+        self.T5_encoder = T5_encoder.to('cuda')
+        self.T5_encoder.eval()
+        self.T5_tokenizer = T5Tokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", do_lower_case=False )
+
+        tm_vec_model_cpnt = "/home/yunqing/ppi/OntoProtein/src/tm_vec_cath_model.ckpt"
+        tm_vec_model_config = "/home/yunqing/ppi/OntoProtein/src/tm_vec_cath_model_params.json"
+
+         #Load the TM-Vec model
+        tm_vec_model_config = trans_basic_block_Config.from_json(tm_vec_model_config)
+        model_deep = trans_basic_block.load_from_checkpoint(tm_vec_model_cpnt, config=tm_vec_model_config)
+        model_deep = model_deep.to('cuda')
+        model_deep = model_deep.eval()
+        self.model_deep = model_deep
+
+        self.device = 'cuda'
+
+        self.loss_func = nn.CrossEntropyLoss()
+        
+
+    def __call__(
+        self,
+        model: GLProtein,
+        **kwargs
+    ):
+        protein_mlm_input_ids = kwargs.pop('input_ids', None)
+        protein_sequence = kwargs.pop('sequence', None)
+
+        tmvec = torch.tensor(encode(protein_sequence,self.model_deep,self.T5_encoder,self.T5_tokenizer,self.device))
+
+        batch_size = tmvec.shape[0]
+        
+        y_true = torch.cat([torch.arange(1,batch_size,step=2,dtype=torch.long).unsqueeze(1),
+                    torch.arange(0,batch_size,step=2,dtype=torch.long).unsqueeze(1)],
+                    dim=1).reshape([batch_size,])
+        norm_emb = F.normalize(tmvec, dim=1, p=2)
+        sim_score = torch.matmul(norm_emb, norm_emb.transpose(0,1))
+        sim_score = sim_score - torch.eye(batch_size) * 1e12
+        sim_score = sim_score * 20      #
+        loss = self.loss_func(sim_score, y_true)
+
+        return loss
+
+

@@ -1,0 +1,9 @@
+transformers
+torch
+lmdb
+scipy
+gensim
+mol2vec
+rdkit
+biopython
+accelerate
