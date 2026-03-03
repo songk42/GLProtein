@@ -66,7 +66,33 @@ Pass these paths to `run_pretrain_refactor.py`:
 
 Download UniProt data from https://drive.google.com/file/d/1fsfE8kG6oBJor7tr2RJfOyFGAMj6woVM, decompress it and save it in `/data/pretrain_data`.
 
-Create a TSV file where each line is `<anchor_sequence>\t<positive_sequence>`. Sequences should be raw amino-acid strings from UniProt. If using Google Colab, follow instructions in `GLProtein_TMVec_Colab.ipynb` to generate sequence pairs and save the file in `/data/pretrain_data`.
+Run the following to create the sequence pair TSV file for TM-Vec in `/data/pretrain_data`:
+```bash
+# Small-scale testing
+python generate_tmvec_pairs_tsv.py \
+  --uniprot_dat data/pretrain_data/uniprot_sprot.dat \
+  --out_tsv data/pretrain_data/tmvec_pairs.tsv \
+  --tmvec_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
+  --tmvec_config assets/tmvec/tm_vec_cath_model_params.json \
+  --device cuda \
+  --max_proteins 500 \
+  --top_k 5 \
+  --pairs_per_anchor 1 \
+  --encode_batch_size 2
+
+# Full-scale dataset
+python generate_tmvec_pairs_tsv.py \
+  --uniprot_dat data/pretrain_data/uniprot_sprot.dat \
+  --out_tsv data/pretrain_data/tmvec_pairs.tsv \
+  --tmvec_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
+  --tmvec_config assets/tmvec/tm_vec_cath_model_params.json \
+  --device cuda \
+  --max_proteins <SET_AS_PAPER> \
+  --top_k 50 \
+  --pairs_per_anchor 1 \
+  --use_faiss \
+  --encode_batch_size 8
+```
 
 ---
 
@@ -98,14 +124,14 @@ python run_pretrain_refactor.py \
 ```bash
 python run_pretrain_refactor.py \
   --output_dir outputs/mlm_plus_tmvec_quick \
-  --per_device_train_batch_size 2 \
-  --protein_seq_sample_limit 5 \
+  --per_device_train_batch_size 4 \
+  --protein_seq_sample_limit 10 \
   --max_steps 10 \
-  --tmvec_pairs_tsv data/pretrain_data/tmvec_pairs.tsv \
+  --tmvec_pairs_tsv tmvec_pairs.tsv \
   --use_tmvec_loss True \
   --tmvec_model_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
   --tmvec_model_config_json assets/tmvec/tm_vec_cath_model_params.json \
-  --tmvec_device cuda
+  --tmvec_device cpu
 ```
 
 ### (7.2) Full pretraining
@@ -125,5 +151,4 @@ python run_pretrain_refactor.py \
 
 ## (8) Troubleshooting
 - If you see an error about `sequence` missing, you are not using `ProteinSeqPairDataset` (or your collator did not pass through `sequence`).
-- If you see an error about batch size needing to be even, set
-  `--per_device_train_batch_size` to an even number.
+- If you see an error about batch size needing to be even, set `--per_device_train_batch_size` to an even number.
