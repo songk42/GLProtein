@@ -4,7 +4,7 @@ from torch._C import dtype
 from transformers import PreTrainedTokenizerBase
 from typing import List, Dict, Optional, Tuple
 import numpy as np
-from src_refactor.dataset import ProteinGoInputFeatures, GoGoInputFeatures, ProteinSeqInputFeatures
+from src_refactor.dataset import ProteinGoInputFeatures, GoGoInputFeatures, ProteinSeqInputFeatures, ProteinSeqPairInputFeatures
 import random
 
 
@@ -16,7 +16,7 @@ def _collate_batch_for_protein_seq(
     are_protein_length_same: bool
 ):  
     # import ipdb;ipdb.set_trace()
-    if isinstance(examples[0], ProteinSeqInputFeatures):
+    if isinstance(examples[0], (ProteinSeqInputFeatures, ProteinSeqPairInputFeatures)):
         examples = [torch.tensor(e.input_ids, dtype=torch.long) for e in examples]
 
     if are_protein_length_same:
@@ -513,6 +513,10 @@ class DataCollatorForLanguageModeling:
         # example here is a list of ProteinSeqInputFeatures
 
         batch = {'input_ids': _collate_batch_for_protein_seq(examples, self.tokenizer, self.are_protein_length_same)}
+
+        if hasattr(examples[0], 'sequence'):
+            batch['sequence'] = [getattr(e, 'sequence') for e in examples]
+
         # protein_coordinates
         # batch['protein_coordinates'] = _collate_batch_for_protein_cor(examples, self.tokenizer, self.are_protein_length_same)
         # batch['aa_vec'] = _collate_batch_for_aa_vec(examples, self.tokenizer, self.are_protein_length_same)

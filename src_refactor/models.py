@@ -14,6 +14,18 @@ from transformers import PreTrainedModel, AutoConfig, PretrainedConfig,BertPreTr
 from transformers.models.bert.modeling_bert import BertEmbeddings, BertEncoder
 # from .tm_vec.embed_structure_model import trans_basic_block, trans_basic_block_Config
 # from .tm_vec.tm_vec_utils import featurize_prottrans, embed_tm_vec, encode
+
+# TM-Vec (global structure component)
+# We rely on https://github.com/tymor22/tm-vec installed in the environment.
+try:
+    from tm_vec.embed_structure_model import trans_basic_block, trans_basic_block_Config
+    from tm_vec.tm_vec_utils import encode
+    _TMVEC_IMPORT_ERROR = None
+except Exception as e:
+    trans_basic_block = None
+    trans_basic_block_Config = None
+    encode = None
+    _TMVEC_IMPORT_ERROR = e
 from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
@@ -1074,54 +1086,76 @@ def copy_layers(src_layers, dest_layers, layers_to_copy):
 @dataclass
 class TMVecLoss:
     """
-    Loss function for TMVec Embedding Similarity.
+    Global structure component: TM-Vec contrastive loss on paired sequences.
 
-    Args:
-        tmv_lambda: hyper-parameters to control the effect of MLM loss.
+    Note: The current implementation assumes paired batches:
+        (0, 1), (2, 3), ... are positive pairs.
+
+    It uses the tm-vec repo (https://github.com/tymor22/tm-vec) to:
+      - load a TM-Vec model checkpoint
+      - encode sequences into structural embeddings
     """
-    def __init__(self,tmv_lambda=1.0):
-        self.tmv_lambda = tmv_lambda
-        T5_encoder = T5EncoderModel.from_pretrained("Rostlab/prot_t5_xl_uniref50")
-        self.T5_encoder = T5_encoder.to('cuda')
-        self.T5_encoder.eval()
-        self.T5_tokenizer = T5Tokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50", do_lower_case=False )
 
-        tm_vec_model_cpnt = "/home/yunqing/ppi/OntoProtein/src/tm_vec_cath_model.ckpt"
-        tm_vec_model_config = "/home/yunqing/ppi/OntoProtein/src/tm_vec_cath_model_params.json"
+    def __init__(
+        self,
+        tm_vec_model_ckpt: str,
+        tm_vec_model_config_json: str,
+        prot_t5_name: str = "Rostlab/prot_t5_xl_uniref50",
+        device: str = "cuda",
+        temperature: float = 20.0,
+        freeze: bool = True,
+    ):
+        if encode is None or trans_basic_block is None or trans_basic_block_Config is None:
+            raise ImportError("Failed to import TM-Vec")
 
-         #Load the TM-Vec model
-        tm_vec_model_config = trans_basic_block_Config.from_json(tm_vec_model_config)
-        model_deep = trans_basic_block.load_from_checkpoint(tm_vec_model_cpnt, config=tm_vec_model_config)
-        model_deep = model_deep.to('cuda')
-        model_deep = model_deep.eval()
-        self.model_deep = model_deep
+        if tm_vec_model_ckpt is None or tm_vec_model_config_json is None:
+            raise ValueError("No tm_vec_model_ckpt/tm_vec_model_config_json")
 
-        self.device = 'cuda'
+        self.device = device
+        self.temperature = float(temperature)
+        self.freeze = bool(freeze)
+
+        self.T5_encoder = T5EncoderModel.from_pretrained(prot_t5_name).to(self.device)
+        self.T5_tokenizer = T5Tokenizer.from_pretrained(prot_t5_name, do_lower_case=False)
+        # tm-vec expects tokenizer.batch_encode_plus in some versions
+        if not hasattr(self.T5_tokenizer, "batch_encode_plus"):
+            self.T5_tokenizer.batch_encode_plus = self.T5_tokenizer.__call__
+
+        cfg = trans_basic_block_Config.from_json(tm_vec_model_config_json)
+        self.model_deep = trans_basic_block.load_from_checkpoint(tm_vec_model_ckpt, config=cfg).to(self.device)
+
+        if self.freeze:
+            self.T5_encoder.eval()
+            self.model_deep.eval()
 
         self.loss_func = nn.CrossEntropyLoss()
-        
 
-    def __call__(
-        self,
-        model: GLProtein,
-        **kwargs
-    ):
-        protein_mlm_input_ids = kwargs.pop('input_ids', None)
-        protein_sequence = kwargs.pop('sequence', None)
+    def __call__(self, model: "GLProtein", **kwargs):
+        protein_sequence = kwargs.pop("sequence", None)
+        if protein_sequence is None:
+            raise ValueError("No protein_sequence")
 
-        tmvec = torch.tensor(encode(protein_sequence,self.model_deep,self.T5_encoder,self.T5_tokenizer,self.device))
+        tm_vec_numpy = encode(protein_sequence, self.model_deep, self.T5_encoder, self.T5_tokenizer, self.device)
+        tm_vec = torch.as_tensor(tm_vec_numpy, device=self.device, dtype=torch.float32)
 
-        batch_size = tmvec.shape[0]
-        
-        y_true = torch.cat([torch.arange(1,batch_size,step=2,dtype=torch.long).unsqueeze(1),
-                    torch.arange(0,batch_size,step=2,dtype=torch.long).unsqueeze(1)],
-                    dim=1).reshape([batch_size,])
-        norm_emb = F.normalize(tmvec, dim=1, p=2)
-        sim_score = torch.matmul(norm_emb, norm_emb.transpose(0,1))
-        sim_score = sim_score - torch.eye(batch_size) * 1e12
-        sim_score = sim_score * 20      #
+        batch_size = tm_vec.shape[0]
+        if batch_size % 2 != 0:
+            raise ValueError("Batch size not even")
+
+        y_true = torch.cat(
+            [
+                torch.arange(1, batch_size, step=2, dtype=torch.long, device=self.device).unsqueeze(1),
+                torch.arange(0, batch_size, step=2, dtype=torch.long, device=self.device).unsqueeze(1),
+            ],
+            dim=1,
+        ).reshape([batch_size])
+
+        norm_emb = F.normalize(tm_vec, dim=1, p=2)
+        sim_score = torch.matmul(norm_emb, norm_emb.transpose(0, 1))
+        sim_score = sim_score - torch.eye(batch_size, device=self.device) * 1e12
+        sim_score = sim_score * self.temperature
+
         loss = self.loss_func(sim_score, y_true)
-
         return loss
 
 

@@ -24,7 +24,7 @@ from transformers.file_utils import is_apex_available, is_sagemaker_mp_enabled
 
 from src_refactor.dataset import GoGoDataset, ProteinGoDataset, ProteinSeqDataset
 from src_refactor.dataloader import DataCollatorForLanguageModeling, DataCollatorForGoGo, DataCollatorForProteinGo
-from src_refactor.models import GLProtein, KnowledgeDecoder, GLProteinLoss
+from src_refactor.models import GLProtein, KnowledgeDecoder, GLProteinLoss, TMVecLoss
 from src.optimization import get_scheduler
 
 
@@ -85,6 +85,21 @@ class GLProteinTrainer(Trainer):
 
         self.model_loss = GLProteinLoss(pfi_weight = self.args.pfi_lambda, mlm_lambda=self.args.mlm_lambda,
             num_protein_go_neg_sample=self.args.num_protein_go_neg_sample)
+
+        # Optional global structure component (TM-Vec loss)
+        self.tmvec_loss = None
+        if getattr(self.args, "use_tmvec_loss", False):
+            if self.args.tmvec_model_ckpt is None or self.args.tmvec_model_config_json is None:
+                raise ValueError("use_tmvec_loss=True but no tmvec_model_ckpt/tmvec_model_config_json")
+            tm_device = self.args.tmvec_device if self.args.tmvec_device is not None else str(self.args.device)
+            self.tmvec_loss = TMVecLoss(
+                tm_vec_model_ckpt=self.args.tmvec_model_ckpt,
+                tm_vec_model_config_json=self.args.tmvec_model_config_json,
+                prot_t5_name=self.args.tmvec_prot_t5_name,
+                device=tm_device,
+                temperature=self.args.tmvec_temperature,
+                freeze=self.args.tmvec_freeze,
+            )
 
         self.use_amp = False
 
@@ -570,6 +585,11 @@ class GLProteinTrainer(Trainer):
         #         total_loss += mlm_loss
         #         all_loss['mlm_loss'] = mlm_loss.item()
         
+        # Add TM-Vec contrastive loss if enabled
+        if self.tmvec_loss is not None and protein_seq_inputs is not None and "sequence" in protein_seq_inputs:
+            tmv_loss = self.tmvec_loss(model=model, **protein_seq_inputs)
+            total_loss = total_loss + self.args.tmvec_weight * tmv_loss
+            all_loss["tmvec_loss"] = float(tmv_loss.detach().cpu())
         return total_loss, all_loss
 
     def num_examples(self, dataloader: DataLoader) -> int:
@@ -639,17 +659,11 @@ class GLProteinTrainer(Trainer):
             # TODO: default choose `sharded_ddp` == `zero_dp_2`
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
-    def create_scheduler(self, num_training_steps: int):
+    def create_scheduler(self, num_training_steps: int, optimizer=None, **kwargs):
         """
-        Setup the scheduler. The optimizer of the trainer must have been set up before this method is called.
-
-        Note: It is overrided from `transformer.Trainer.create_scheduler`.
-
-        Args:
-            num_training_steps (int): The number of training steps to do.
+        Setup the scheduler. The optimizer must have been set up before this method is called.
         """
         if self.lr_scheduler is None:
-            # scale `num_training_steps`
             if self.args.deepspeed:
                 num_training_steps = num_training_steps // self.args.gradient_accumulation_steps + int(
                     num_training_steps % self.args.gradient_accumulation_steps > 0
@@ -657,7 +671,7 @@ class GLProteinTrainer(Trainer):
 
             self.lr_scheduler = get_scheduler(
                 self.args.lr_scheduler_type,
-                self.optimizer,
+                optimizer if optimizer is not None else self.optimizer,
                 num_lm_warmup_steps=self.args.get_lm_warmup_steps(num_training_steps),
                 num_training_steps=num_training_steps,
             )

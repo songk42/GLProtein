@@ -2,6 +2,7 @@ from collections import defaultdict
 from json import decoder
 import math
 from dataclasses import dataclass, field
+from typing import Optional
 from transformers import logging
 from transformers.training_args import TrainingArguments
 
@@ -125,6 +126,40 @@ class KMAETrainingArguments(TrainingArguments):
     pfi_lambda: float = field(
         default=1.0,
         metadata={"help": "Weight of Protein Function Inference loss."}
+    )
+
+    # Global structure / TM-Vec loss (optional)
+    use_tmvec_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to add the TM-Vec contrastive loss during pretraining."}
+    )
+    tmvec_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight for TM-Vec loss."}
+    )
+    tmvec_model_ckpt: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to TM-Vec checkpoint (.ckpt)."}
+    )
+    tmvec_model_config_json: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to TM-Vec model params JSON."}
+    )
+    tmvec_prot_t5_name: str = field(
+        default="Rostlab/prot_t5_xl_uniref50",
+        metadata={"help": "ProtT5 encoder name for TM-Vec."}
+    )
+    tmvec_device: Optional[str] = field(
+        default=None,
+        metadata={"help": "Device for TM-Vec ('cuda' or 'cpu')."}
+    )
+    tmvec_temperature: float = field(
+        default=20.0,
+        metadata={"help": "Temperature for similarity logits in TMVecLoss."}
+    )
+    tmvec_freeze: bool = field(
+        default=True,
+        metadata={"help": "Whether to freeze TM-Vec and ProtT5 encoders."}
     )
 
 
@@ -293,6 +328,16 @@ class DataArguments:
     in_memory: bool = field(
         default=False,
         metadata={"help": "Whether or not to save data into memory during sampling"}
+    )
+
+    tmvec_pairs_tsv: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the sequence pair TSV for TMVecLoss."}
+    )
+
+    protein_seq_sample_limit: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional limit on number of protein sequence examples loaded."}
     )
 
     # negative sampling

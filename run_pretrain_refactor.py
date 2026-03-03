@@ -9,7 +9,7 @@ from transformers import BertTokenizer, AutoTokenizer, logging
 from src_refactor.models import GLProtein, GLProteinConfig, KnowledgeDecoder
 from src_refactor.trainer import GLProteinTrainer
 from src.sampling import negative_sampling_strategy
-from src_refactor.dataset import ProteinSeqDataset, ProteinGoDataset
+from src_refactor.dataset import ProteinSeqDataset, ProteinSeqPairDataset, ProteinGoDataset
 from src_refactor.dataloader import DataCollatorForGoGo, DataCollatorForLanguageModeling, DataCollatorForProteinGo
 from src_refactor.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
 
@@ -67,14 +67,27 @@ def main():
             sample_head=data_args.protein_go_sample_head,
             sample_tail=data_args.protein_go_sample_tail,
             max_protein_seq_length=data_args.max_protein_seq_length,
+            protein_seq_sample_limit=data_args.protein_seq_sample_limit,
             max_text_seq_length=data_args.max_text_seq_length
         )
     elif data_args.model_protein_seq_data:
-        protein_seq_dataset = ProteinSeqDataset(
-            data_dir=data_args.pretrain_data_dir,
-            tokenizer=protein_tokenizer,
-            max_protein_seq_length=data_args.max_protein_seq_length
-        )
+        if training_args.use_tmvec_loss:
+            if data_args.tmvec_pairs_tsv is None:
+                raise ValueError("use_tmvec_loss=True but data_args.tmvec_pairs_tsv is None")
+            protein_seq_dataset = ProteinSeqPairDataset(
+                data_dir=data_args.pretrain_data_dir,
+                pairs_tsv=data_args.tmvec_pairs_tsv,
+                tokenizer=protein_tokenizer,
+                max_protein_seq_length=data_args.max_protein_seq_length,
+                protein_seq_sample_limit=data_args.protein_seq_sample_limit,
+            )
+        else:
+            protein_seq_dataset = ProteinSeqDataset(
+                data_dir=data_args.pretrain_data_dir,
+                tokenizer=protein_tokenizer,
+                max_protein_seq_length=data_args.max_protein_seq_length,
+                protein_seq_sample_limit=data_args.protein_seq_sample_limit
+            )
 
     # # whether to use protein function inference task during pretraining
     use_pfi = training_args.use_pfi
