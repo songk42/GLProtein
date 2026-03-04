@@ -1094,68 +1094,100 @@ class TMVecLoss:
     It uses the tm-vec repo (https://github.com/tymor22/tm-vec) to:
       - load a TM-Vec model checkpoint
       - encode sequences into structural embeddings
+    
+    Supports usage of precomputed embeddings when `tmvec_emb` is provided
     """
 
     def __init__(
         self,
-        tm_vec_model_ckpt: str,
-        tm_vec_model_config_json: str,
+        tm_vec_model_ckpt: str | None = None,
+        tm_vec_model_config_json: str | None = None,
         prot_t5_name: str = "Rostlab/prot_t5_xl_uniref50",
         device: str = "cuda",
         temperature: float = 20.0,
         freeze: bool = True,
+        use_half: bool = False,
     ):
+        self.temperature = float(temperature)
+        self.loss_func = nn.CrossEntropyLoss()
+
+        # Online encoding components for TMVec
+        self._online_ready = False
+        self._tm_vec_model_ckpt = tm_vec_model_ckpt
+        self._tm_vec_model_config_json = tm_vec_model_config_json
+        self._prot_t5_name = prot_t5_name
+        self._device = device
+        self._freeze = bool(freeze)
+        self._use_half = bool(use_half)
+
+        self.T5_encoder = None
+        self.T5_tokenizer = None
+        self.model_deep = None
+
+    def _ensure_online_encoder(self):
+        if self._online_ready:
+            return
         if encode is None or trans_basic_block is None or trans_basic_block_Config is None:
             raise ImportError("Failed to import TM-Vec")
-
-        if tm_vec_model_ckpt is None or tm_vec_model_config_json is None:
+        if self._tm_vec_model_ckpt is None or self._tm_vec_model_config_json is None:
             raise ValueError("No tm_vec_model_ckpt/tm_vec_model_config_json")
 
-        self.device = device
-        self.temperature = float(temperature)
-        self.freeze = bool(freeze)
-
-        self.T5_encoder = T5EncoderModel.from_pretrained(prot_t5_name).to(self.device)
-        self.T5_tokenizer = T5Tokenizer.from_pretrained(prot_t5_name, do_lower_case=False)
+        self.T5_encoder = T5EncoderModel.from_pretrained(self._prot_t5_name).to(self._device)
+        self.T5_tokenizer = T5Tokenizer.from_pretrained(self._prot_t5_name, do_lower_case=False)
         # tm-vec expects tokenizer.batch_encode_plus in some versions
         if not hasattr(self.T5_tokenizer, "batch_encode_plus"):
             self.T5_tokenizer.batch_encode_plus = self.T5_tokenizer.__call__
 
-        cfg = trans_basic_block_Config.from_json(tm_vec_model_config_json)
-        self.model_deep = trans_basic_block.load_from_checkpoint(tm_vec_model_ckpt, config=cfg).to(self.device)
+        cfg = trans_basic_block_Config.from_json(self._tm_vec_model_config_json)
+        self.model_deep = trans_basic_block.load_from_checkpoint(self._tm_vec_model_ckpt, config=cfg).to(self._device)
 
-        if self.freeze:
+        if self._freeze:
             self.T5_encoder.eval()
             self.model_deep.eval()
 
-        self.loss_func = nn.CrossEntropyLoss()
+        if self._use_half and str(self._device).startswith("cuda"):
+            self.T5_encoder.half()
+            self.model_deep.half()
+
+        self._online_ready = True
 
     def __call__(self, model: "GLProtein", **kwargs):
-        protein_sequence = kwargs.pop("sequence", None)
-        if protein_sequence is None:
-            raise ValueError("No protein_sequence")
+        # Use precomputed embeddings if possible
+        tmvec_emb = kwargs.pop("tmvec_emb", None)
+        if tmvec_emb is not None:
+            if not torch.is_tensor(tmvec_emb):
+                tmvec = torch.as_tensor(tmvec_emb, dtype=torch.float32, device=model.device if hasattr(model, "device") else None)
+            else:
+                tmvec = tmvec_emb
+            # Use float32 for stability
+            tmvec = tmvec.float()
+        else:
+            # Encode online from raw sequences
+            protein_sequence = kwargs.pop("sequence", None)
+            if protein_sequence is None:
+                raise ValueError("No protein_sequence")
+            self._ensure_online_encoder()
+            with torch.no_grad():
+                tmvec_np = encode(protein_sequence, self.model_deep, self.T5_encoder, self.T5_tokenizer, self._device)
+            tmvec = torch.as_tensor(tmvec_np, device=self._device, dtype=torch.float32)
 
-        tm_vec_numpy = encode(protein_sequence, self.model_deep, self.T5_encoder, self.T5_tokenizer, self.device)
-        tm_vec = torch.as_tensor(tm_vec_numpy, device=self.device, dtype=torch.float32)
-
-        batch_size = tm_vec.shape[0]
+        batch_size = tmvec.shape[0]
         if batch_size % 2 != 0:
             raise ValueError("Batch size not even")
 
+        device = tmvec.device
         y_true = torch.cat(
             [
-                torch.arange(1, batch_size, step=2, dtype=torch.long, device=self.device).unsqueeze(1),
-                torch.arange(0, batch_size, step=2, dtype=torch.long, device=self.device).unsqueeze(1),
+                torch.arange(1, batch_size, step=2, dtype=torch.long, device=device).unsqueeze(1),
+                torch.arange(0, batch_size, step=2, dtype=torch.long, device=device).unsqueeze(1),
             ],
             dim=1,
         ).reshape([batch_size])
 
-        norm_emb = F.normalize(tm_vec, dim=1, p=2)
+        norm_emb = F.normalize(tmvec, dim=1, p=2)
         sim_score = torch.matmul(norm_emb, norm_emb.transpose(0, 1))
-        sim_score = sim_score - torch.eye(batch_size, device=self.device) * 1e12
+        sim_score = sim_score - torch.eye(batch_size, device=device) * 1e12
         sim_score = sim_score * self.temperature
 
-        loss = self.loss_func(sim_score, y_true)
-        return loss
-
+        return self.loss_func(sim_score, y_true)
 

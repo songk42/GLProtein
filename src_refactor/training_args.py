@@ -162,6 +162,10 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Whether to freeze TM-Vec and ProtT5 encoders."}
     )
 
+    tmvec_use_half: bool = field(
+        default=False,
+        metadata={"help": "Whether to use half precision for TM-Vec to save memory."}
+    )
 
     # respectively set learning rate to training of protein language model and knowledge embedding
     lm_learning_rate: float = field(
@@ -333,6 +337,11 @@ class DataArguments:
     tmvec_pairs_tsv: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the sequence pair TSV for TMVecLoss."}
+    )
+
+    tmvec_pairs_emb_npy: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to precomputed embeddings NPY for TMVecLoss"}
     )
 
     protein_seq_sample_limit: Optional[int] = field(

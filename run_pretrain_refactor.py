@@ -77,6 +77,7 @@ def main():
             protein_seq_dataset = ProteinSeqPairDataset(
                 data_dir=data_args.pretrain_data_dir,
                 pairs_tsv=data_args.tmvec_pairs_tsv,
+                tmvec_emb_npy=data_args.tmvec_pairs_emb_npy,
                 tokenizer=protein_tokenizer,
                 max_protein_seq_length=data_args.max_protein_seq_length,
                 protein_seq_sample_limit=data_args.protein_seq_sample_limit,

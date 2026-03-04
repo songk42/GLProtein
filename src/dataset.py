@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 from scipy.spatial import distance_matrix
 import pickle
-from .prediction import prediction
+# from .prediction import prediction
 import numpy as np
 import math as m
 from gensim.models import word2vec
@@ -22,6 +22,8 @@ from mol2vec.features import mol2alt_sentence, MolSentence, DfVec, sentences2vec
 from rdkit import Chem
 import re
 from transformers import T5Tokenizer
+from Bio import SwissProt
+from itertools import islice
 
 
 
@@ -275,6 +277,9 @@ class ProteinGoDataset(Dataset):
         aa_vocab = dict()
 
         tmp_tokenizer = T5Tokenizer.from_pretrained("Rostlab/prot_t5_xl_uniref50")
+        # tm-vec expects tokenizer.batch_encode_plus in some versions
+        if not hasattr(tmp_tokenizer, "batch_encode_plus"):
+            tmp_tokenizer.batch_encode_plus = tmp_tokenizer.__call__
         tmp_vocab = tmp_tokenizer.get_vocab()
         keys = list (tmp_vocab.keys())
         signal = keys[5][0]
@@ -455,7 +460,8 @@ class ProteinSeqDataset(Dataset):
         seq_data_path: str = None,
         tokenizer: PreTrainedTokenizerBase = None,
         in_memory: bool=True,
-        max_protein_seq_length: int = None
+        max_protein_seq_length: int = None,
+        protein_seq_sample_limit: Optional[int] = None
     ):
         self.data_dir = data_dir
         self.seq_data_path = seq_data_path
@@ -470,17 +476,25 @@ class ProteinSeqDataset(Dataset):
         #     cache = [None] * self.num_examples
         #     self.cache = cache
 
-        
-        self.protein_seq = [line.rstrip('\n') for line in open(os.path.join(self.data_dir, 'protein_seq.txt'), 'r')]
         def trans_sequence(sequence):
             sequence = " ".join(sequence)
             sequence = re.sub(r"[UZOB]", "X", sequence) 
             return sequence
+        
+        with open(os.path.join(self.data_dir, "uniprot_sprot.dat")) as f:
+            records = SwissProt.parse(f)
+            if protein_seq_sample_limit is None:
+                self.protein_seq = [r.sequence for r in records]
+            else:
+                self.protein_seq = [r.sequence for r in islice(records, protein_seq_sample_limit)]
+
+        
+        # self.protein_seq = [line.rstrip('\n') for line in open(os.path.join(self.data_dir, 'uniprot_sprot.dat'), 'r')]
         self.protein_seq = [trans_sequence(item) for item in self.protein_seq]
 
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
-        self.protein_cor = pickle.load(open('./ProteinKG25/id2cor_dict.pkl', 'rb'))
+        # self.protein_cor = pickle.load(open('./ProteinKG25/id2cor_dict.pkl', 'rb'))
         
     def __getitem__(self, index):
         # if self.in_memory and self.cache[index] is not None:
@@ -493,41 +507,120 @@ class ProteinSeqDataset(Dataset):
         item = self.protein_seq[index]
 
         # implement padding of sequences at 'DataCollatorForLanguageModeling'
-        item = list(item)
+        # item = list(item)
         if self.max_protein_seq_length is not None:
-            item = item[:self.max_protein_seq_length]
-        input_ids = self.tokenizer.encode(item)
+            tokens = item.split()[:self.max_protein_seq_length]
+            item = " ".join(tokens)
+        input_ids = self.tokenizer.encode(item, add_special_tokens=True)
 
-        cor = self.protein_cor[index]
-        if self.max_protein_seq_length is not None:
-            cor = cor[:self.max_protein_seq_length]
-        ### coordinates normalize & padding
-        cor = np.array(cor)-np.array(cor).mean(axis=0)
-        cor = np.concatenate([np.zeros((1,3)),cor,np.zeros((1,3))],axis=0)
-        cor = cor.tolist()
+        # cor = self.protein_cor[index]
+        # if self.max_protein_seq_length is not None:
+        #     cor = cor[:self.max_protein_seq_length]
+        # ### coordinates normalize & padding
+        # cor = np.array(cor)-np.array(cor).mean(axis=0)
+        # cor = np.concatenate([np.zeros((1,3)),cor,np.zeros((1,3))],axis=0)
+        # cor = cor.tolist()
 
         return ProteinSeqInputFeatures(
             input_ids=input_ids,
-            coordinates=cor,
+            # coordinates=cor,
         )
         
     def __len__(self):
         # return self.num_examples
         return len(self.protein_seq)
     
-    def get_distance_matrix(self,index):
-        item = self.protein_cor[index]
+    # def get_distance_matrix(self,index):
+    #     item = self.protein_cor[index]
+    #     if self.max_protein_seq_length is not None:
+    #         item = item[:self.max_protein_seq_length]
+    #     ### coordinates normalize & padding
+    #     item = np.array(item)-np.array(item).mean(axis=0)
+    #     # item = np.concatenate([np.zeros((1,3)),item,np.zeros((1,3))],axis=0)
+
+    #     ### distance matrix
+
+    #     distance = distance_matrix(item,item)
+
+    #     return distance
+
+
+@dataclass
+class ProteinSeqPairInputFeatures:
+    """
+    A set of features for paired protein sequences used by TMVecLoss.
+    """
+    input_ids: List[int]
+    sequence: str
+
+
+class ProteinSeqPairDataset(Dataset):
+    """
+    A dataset that yields paired protein sequences used by TMVecLoss.
+
+    Expected TSV format: <anchor_sequence>\t<positive_sequence>
+
+    Note: Sequences should be raw amino acid strings from UniProt.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        pairs_tsv: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_protein_seq_length: Optional[int] = None,
+        protein_seq_sample_limit: Optional[int] = None,
+    ):
+        def trans_sequence(sequence: str) -> str:
+            sequence = " ".join(sequence)
+            sequence = re.sub(r"[UZOB]", "X", sequence)
+            return sequence
+
+        self.data_dir = data_dir
+        self.pairs_tsv = pairs_tsv
+        self.tokenizer = tokenizer
+        self.max_protein_seq_length = max_protein_seq_length
+
+        if not os.path.isabs(self.pairs_tsv):
+            self.pairs_tsv = os.path.join(self.data_dir, self.pairs_tsv)
+        if not os.path.exists(self.pairs_tsv):
+            raise FileNotFoundError(f"TSV not found: {self.pairs_tsv}")
+
+        self.pairs: List[Tuple[str, str]] = []
+        with open(self.pairs_tsv, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    raise ValueError("Invalid TSV line")
+                anchor, positive = parts[0].strip(), parts[1].strip()
+                self.pairs.append((trans_sequence(anchor), trans_sequence(positive)))
+
+        if protein_seq_sample_limit is not None:
+            max_pairs = int((protein_seq_sample_limit + 1) // 2)
+            self.pairs = self.pairs[:max_pairs]
+
+        if len(self.pairs) == 0:
+            raise ValueError("No pairs loaded from TSV")
+
+    def __len__(self) -> int:
+        # each pair yields 2 examples (anchor then positive)
+        return len(self.pairs) * 2
+
+    def __getitem__(self, index: int) -> ProteinSeqPairInputFeatures:
+        pair_idx = index // 2
+        anchor_or_positive = index % 2
+        seq = self.pairs[pair_idx][anchor_or_positive]
+
         if self.max_protein_seq_length is not None:
-            item = item[:self.max_protein_seq_length]
-        ### coordinates normalize & padding
-        item = np.array(item)-np.array(item).mean(axis=0)
-        # item = np.concatenate([np.zeros((1,3)),item,np.zeros((1,3))],axis=0)
+            tokens = seq.split()[: self.max_protein_seq_length]
+            seq = " ".join(tokens)
 
-        ### distance matrix
+        input_ids = self.tokenizer.encode(seq, add_special_tokens=True)
+        return ProteinSeqPairInputFeatures(input_ids=input_ids, sequence=seq)
 
-        distance = distance_matrix(item,item)
-
-        return distance
 
 class GoGoDataset(Dataset):
     """

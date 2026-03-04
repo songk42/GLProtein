@@ -552,6 +552,7 @@ class ProteinSeqPairInputFeatures:
     """
     input_ids: List[int]
     sequence: str
+    tmvec_emb: Optional[List[float]] = None
 
 
 class ProteinSeqPairDataset(Dataset):
@@ -567,6 +568,7 @@ class ProteinSeqPairDataset(Dataset):
         self,
         data_dir: str,
         pairs_tsv: str,
+        tmvec_emb_npy: Optional[str],
         tokenizer: PreTrainedTokenizerBase,
         max_protein_seq_length: Optional[int] = None,
         protein_seq_sample_limit: Optional[int] = None,
@@ -598,9 +600,42 @@ class ProteinSeqPairDataset(Dataset):
                 anchor, positive = parts[0].strip(), parts[1].strip()
                 self.pairs.append((trans_sequence(anchor), trans_sequence(positive)))
 
+
+        # Load precomputed TM-Vec embeddings aligned with TSV order
+        # Supported shapes:
+        #   1. (num_pairs, 2, dim): [pair_idx, {anchor, positive}, :]
+        #   2. (num_pairs * 2, dim): [pair0_anchor, pair0_positive, ...]
+        self._has_tmvec = False
+        self._tmvec_emb = None
+        if tmvec_emb_npy is not None:
+            tmvec_path = tmvec_emb_npy
+            if not os.path.isabs(tmvec_path):
+                tmvec_path = os.path.join(self.data_dir, tmvec_path)
+            if not os.path.exists(tmvec_path):
+                raise FileNotFoundError("No TM-Vec embedding .npy")
+            emb = np.load(tmvec_path)
+            if emb.ndim == 3:
+                if emb.shape[0] != len(self.pairs) or emb.shape[1] != 2:
+                    raise ValueError("tmvec_emb shape not supported")
+                self._tmvec_emb = emb
+                self._has_tmvec = True
+            elif emb.ndim == 2:
+                if emb.shape[0] == len(self.pairs) * 2:
+                    self._tmvec_emb = emb
+                    self._has_tmvec = True
+                else:
+                    raise ValueError("tmvec_emb shape not supported")
+            else:
+                raise ValueError("tmvec_emb shape not supported")
+
         if protein_seq_sample_limit is not None:
             max_pairs = int((protein_seq_sample_limit + 1) // 2)
             self.pairs = self.pairs[:max_pairs]
+            if self._has_tmvec:
+                if self._tmvec_emb.ndim == 3:
+                    self._tmvec_emb = self._tmvec_emb[:max_pairs, :, :]
+                else:
+                    self._tmvec_emb = self._tmvec_emb[: max_pairs * 2, :]
 
         if len(self.pairs) == 0:
             raise ValueError("No pairs loaded from TSV")
@@ -619,7 +654,15 @@ class ProteinSeqPairDataset(Dataset):
             seq = " ".join(tokens)
 
         input_ids = self.tokenizer.encode(seq, add_special_tokens=True)
-        return ProteinSeqPairInputFeatures(input_ids=input_ids, sequence=seq)
+
+        tmvec_emb = None
+        if self._has_tmvec:
+            if self._tmvec_emb.ndim == 3:
+                tmvec_emb = self._tmvec_emb[pair_idx, anchor_or_positive].tolist()
+            else:
+                tmvec_emb = self._tmvec_emb[index].tolist()
+
+        return ProteinSeqPairInputFeatures(input_ids=input_ids, sequence=seq, tmvec_emb=tmvec_emb)
 
 
 class GoGoDataset(Dataset):

@@ -520,6 +520,11 @@ class DataCollatorForLanguageModeling:
         # protein_coordinates
         # batch['protein_coordinates'] = _collate_batch_for_protein_cor(examples, self.tokenizer, self.are_protein_length_same)
         # batch['aa_vec'] = _collate_batch_for_aa_vec(examples, self.tokenizer, self.are_protein_length_same)
+        
+        # Use precomputed TM-Vec embeddings if available
+        if hasattr(examples[0], 'tmvec_emb') and getattr(examples[0], 'tmvec_emb') is not None:
+            batch['tmvec_emb'] = torch.tensor([e.tmvec_emb for e in examples], dtype=torch.float32)
+
         special_tokens_mask = batch.pop('special_tokens_mask', None)
         if self.mlm:
             batch['input_ids'], batch['labels'] = self.mask_tokens(

@@ -89,8 +89,6 @@ class GLProteinTrainer(Trainer):
         # Optional global structure component (TM-Vec loss)
         self.tmvec_loss = None
         if getattr(self.args, "use_tmvec_loss", False):
-            if self.args.tmvec_model_ckpt is None or self.args.tmvec_model_config_json is None:
-                raise ValueError("use_tmvec_loss=True but no tmvec_model_ckpt/tmvec_model_config_json")
             tm_device = self.args.tmvec_device if self.args.tmvec_device is not None else str(self.args.device)
             self.tmvec_loss = TMVecLoss(
                 tm_vec_model_ckpt=self.args.tmvec_model_ckpt,
@@ -99,6 +97,7 @@ class GLProteinTrainer(Trainer):
                 device=tm_device,
                 temperature=self.args.tmvec_temperature,
                 freeze=self.args.tmvec_freeze,
+                use_half=getattr(self.args, 'tmvec_use_half', False),
             )
 
         self.use_amp = False
@@ -586,7 +585,7 @@ class GLProteinTrainer(Trainer):
         #         all_loss['mlm_loss'] = mlm_loss.item()
         
         # Add TM-Vec contrastive loss if enabled
-        if self.tmvec_loss is not None and protein_seq_inputs is not None and "sequence" in protein_seq_inputs:
+        if self.tmvec_loss is not None and protein_seq_inputs is not None and ("tmvec_emb" in protein_seq_inputs or "sequence" in protein_seq_inputs):
             tmv_loss = self.tmvec_loss(model=model, **protein_seq_inputs)
             total_loss = total_loss + self.args.tmvec_weight * tmv_loss
             all_loss["tmvec_loss"] = float(tmv_loss.detach().cpu())

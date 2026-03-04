@@ -121,6 +121,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--uniprot_dat", required=True, help="Path to uniprot_sprot.dat or .dat.gz")
     ap.add_argument("--out_tsv", required=True, help="Output TSV path")
+    ap.add_argument("--out_emb_npy", default=None, help="Output .npy path for precomputed TM-Vec embeddings")
+    ap.add_argument("--emb_dtype", default="float16", choices=["float16","float32"], help="Dtype for saved embeddings")
     ap.add_argument("--tmvec_ckpt", required=True, help="TM-Vec checkpoint (.ckpt)")
     ap.add_argument("--tmvec_config", required=True, help="TM-Vec params JSON")
     ap.add_argument("--prot_t5_name", default="Rostlab/prot_t5_xl_uniref50")
@@ -174,6 +176,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.out_tsv) or ".", exist_ok=True)
     out_lines = 0
+    pair_indices: List[Tuple[int,int]] = []
     with open(args.out_tsv, "w", encoding="utf-8") as out:
         for i in range(len(seqs)):
             neighbors = idxs[i].tolist()
@@ -184,9 +187,19 @@ def main():
 
             for j in neighbors[: max(1, min(args.pairs_per_anchor, len(neighbors)))]:
                 out.write(f"{seqs[i]}\t{seqs[j]}\n")
+                pair_indices.append((i, j))
                 out_lines += 1
     print(f"Wrote {out_lines} pairs to: {args.out_tsv}")
 
+    if args.out_emb_npy is not None:
+        dtype = np.float16 if args.emb_dtype == "float16" else np.float32
+        pair_embs = np.empty((len(pair_indices) * 2, embs.shape[1]), dtype=dtype)
+        for k, (a_idx, p_idx) in enumerate(pair_indices):
+            pair_embs[2 * k] = embs[a_idx].astype(dtype, copy=False)
+            pair_embs[2 * k + 1] = embs[p_idx].astype(dtype, copy=False)
+        os.makedirs(os.path.dirname(args.out_emb_npy) or ".", exist_ok=True)
+        np.save(args.out_emb_npy, pair_embs)
+        print(f"Saved pair-order embeddings to: {args.out_emb_npy}  shape={pair_embs.shape} dtype={pair_embs.dtype}")
 
 if __name__ == "__main__":
     main()

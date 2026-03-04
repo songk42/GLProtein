@@ -11,10 +11,11 @@ import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from torch.nn.modules.sparse import Embedding
 from transformers import PreTrainedModel, AutoConfig, PretrainedConfig, BertModel, BertPreTrainedModel
-from transformers.models.bert.modeling_bert import BertOnlyMLMHead, BertIntermediate, BertOutput, BertSelfOutput, prune_linear_layer, BaseModelOutputWithPastAndCrossAttentions, BertEmbeddings
+# from transformers.models.bert.modeling_bert import BertOnlyMLMHead, BertIntermediate, BertOutput, BertSelfOutput, prune_linear_layer, BaseModelOutputWithPastAndCrossAttentions, BertEmbeddings
+from transformers.models.bert.modeling_bert import BertOnlyMLMHead, BertIntermediate, BertOutput, BertSelfOutput, BaseModelOutputWithPastAndCrossAttentions, BertEmbeddings
 from transformers.file_utils import ModelOutput
 from transformers.utils import logging
-from transformers.deepspeed import is_deepspeed_zero3_enabled
+# from transformers.deepspeed import is_deepspeed_zero3_enabled
 from transformers.file_utils import (
     add_code_sample_docstrings,
     add_end_docstrings,
@@ -22,9 +23,11 @@ from transformers.file_utils import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
 )
-from transformers.modeling_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices
+# from transformers.modeling_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices
+from transformers.pytorch_utils import apply_chunking_to_forward
+# from transformers.modeling_utils import find_pruneable_heads_and_indices
 from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions,Seq2SeqLMOutput,BaseModelOutput
-from deepspeed import DeepSpeedEngine
+# from deepspeed import DeepSpeedEngine
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple, List
 import torch.nn.functional as F
 import warnings
@@ -420,42 +423,47 @@ class BertLayer(nn.Module):
 
         # import ipdb; ipdb.set_trace()
 
-        # cross-attention with coordinates, hidden states is protein input
-        self_coordinate_attention_outputs = self.coordinate_attention(
-            hidden_states,
-            attention_mask,
-            head_mask,
-            text_hidden_states=coordinate_hidden_states,
-            text_attention_mask=coordinate_attention_mask,
-            output_attentions=output_attentions,
-            past_key_value=self_attn_past_key_value,
-        )
-        coordinate_attention_output = self_coordinate_attention_outputs[0]
+        # # cross-attention with coordinates, hidden states is protein input
+        # self_coordinate_attention_outputs = self.coordinate_attention(
+        #     hidden_states,
+        #     attention_mask,
+        #     head_mask,
+        #     text_hidden_states=coordinate_hidden_states,
+        #     text_attention_mask=coordinate_attention_mask,
+        #     output_attentions=output_attentions,
+        #     past_key_value=self_attn_past_key_value,
+        # )
+        # coordinate_attention_output = self_coordinate_attention_outputs[0]
 
-        # cross-attention with aa_vec, hidden states is output of coordinate_attention
-        self_aa_vec_attention_outputs = self.aa_vec_attention(
-            coordinate_attention_output,
-            attention_mask,
-            head_mask,
-            text_hidden_states=aa_vec_hidden_states,
-            text_attention_mask=aa_vec_attention_mask,
-            output_attentions=output_attentions,
-            past_key_value=self_attn_past_key_value,
-        )
+        # # cross-attention with aa_vec, hidden states is output of coordinate_attention
+        # self_aa_vec_attention_outputs = self.aa_vec_attention(
+        #     coordinate_attention_output,
+        #     attention_mask,
+        #     head_mask,
+        #     text_hidden_states=aa_vec_hidden_states,
+        #     text_attention_mask=aa_vec_attention_mask,
+        #     output_attentions=output_attentions,
+        #     past_key_value=self_attn_past_key_value,
+        # )
         
 
-        aa_vec_attention_output = self_aa_vec_attention_outputs[0]
+        # aa_vec_attention_output = self_aa_vec_attention_outputs[0]
 
 
-        go_attention_output = self_aa_vec_attention_outputs[0]
-        go_outputs = self_aa_vec_attention_outputs[1:]  # add self attentions if we output attention weights
+        # go_attention_output = self_aa_vec_attention_outputs[0]
+        # go_outputs = self_aa_vec_attention_outputs[1:]  # add self attentions if we output attention weights
         #
         # original code chunks tensors and apply feed_forward_chunk to each chunk independently if chunk_size_feed_forward>0 to save memory
-        layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, go_attention_output
-        )
+        # layer_output = apply_chunking_to_forward(
+        #     self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, go_attention_output
+        # )
 
-        outputs = (layer_output,) + go_outputs
+        # outputs = (layer_output,) + go_outputs
+        layer_output = apply_chunking_to_forward(
+            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, hidden_states
+        )
+        outputs = (layer_output,)
+
 
         # if decoder, return the attn key/values as the last output
         # if self.is_decoder:
@@ -574,6 +582,7 @@ class BertEncoder(nn.Module):
                 ]
                 if v is not None
             )
+        
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_decoder_cache,
@@ -683,33 +692,33 @@ class KnowledgeBertModel(BertPreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
         
-        #input shape for coordinate
-        if coordinate_hidden_states is not None:
-            coordinate_input_shape = coordinate_hidden_states.size()[:-1]
-        else:
-            raise ValueError("You have to specify coordinate_hidden_states, features of coordinate")
+        # #input shape for coordinate
+        # if coordinate_hidden_states is not None:
+        #     coordinate_input_shape = coordinate_hidden_states.size()[:-1]
+        # else:
+        #     raise ValueError("You have to specify coordinate_hidden_states, features of coordinate")
         
-        #input shape for aa_vec
-        if aa_vec_hidden_states is not None:
-            aa_vec_input_shape = aa_vec_hidden_states.size()[:-1]
-        else:
-            raise ValueError("You have to specify aa_vec_hidden_states, features of aa_vec")
+        # #input shape for aa_vec
+        # if aa_vec_hidden_states is not None:
+        #     aa_vec_input_shape = aa_vec_hidden_states.size()[:-1]
+        # else:
+        #     raise ValueError("You have to specify aa_vec_hidden_states, features of aa_vec")
 
-        # input shape for relation
-        if relation_hidden_states is not None:
-            relation_input_shape = relation_hidden_states.size()[:-1]
-        else:
-            raise ValueError("You have to specify relation_hidden_states, features of relation")
+        # # input shape for relation
+        # if relation_hidden_states is not None:
+        #     relation_input_shape = relation_hidden_states.size()[:-1]
+        # else:
+        #     raise ValueError("You have to specify relation_hidden_states, features of relation")
 
-        # input shape for GO
-        if go_hidden_states is not None:
-            go_input_shape = go_hidden_states.size()[:-1]
-        else:
-            raise ValueError("You have to specify go_hidden_states, features of GO")
+        # # input shape for GO
+        # if go_hidden_states is not None:
+        #     go_input_shape = go_hidden_states.size()[:-1]
+        # else:
+        #     raise ValueError("You have to specify go_hidden_states, features of GO")
 
-        # not doing self attention of protein sequences, only need the attention mask for relation and go
-        batch_size, relation_seq_length = relation_input_shape
-        go_seq_length = go_input_shape[1]
+        # # not doing self attention of protein sequences, only need the attention mask for relation and go
+        # batch_size, relation_seq_length = relation_input_shape
+        # go_seq_length = go_input_shape[1]
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         # past_key_values_length
@@ -717,18 +726,18 @@ class KnowledgeBertModel(BertPreTrainedModel):
 
 
 
-        extended_coordinate_attention_mask = coordinate_attention_mask[:,None,None,:].to(dtype=self.dtype)
-        extended_coordinate_attention_mask = (1.0 - extended_coordinate_attention_mask) * -10000.0
+        # extended_coordinate_attention_mask = coordinate_attention_mask[:,None,None,:].to(dtype=self.dtype)
+        # extended_coordinate_attention_mask = (1.0 - extended_coordinate_attention_mask) * -10000.0
 
-        extended_aa_vec_attention_mask = aa_vec_attention_mask[:,None,None,:].to(dtype=self.dtype)
-        extended_aa_vec_attention_mask = (1.0 - extended_aa_vec_attention_mask) * -10000.0
+        # extended_aa_vec_attention_mask = aa_vec_attention_mask[:,None,None,:].to(dtype=self.dtype)
+        # extended_aa_vec_attention_mask = (1.0 - extended_aa_vec_attention_mask) * -10000.0
 
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_relation_attention_mask = relation_attention_mask[:,None,None,:].to(dtype=self.dtype)
-        extended_relation_attention_mask = (1.0 - extended_relation_attention_mask) * -10000.0
-        extended_go_attention_mask = go_attention_mask[:,None,None,:].to(dtype=self.dtype)
-        extended_go_attention_mask = (1.0 - extended_go_attention_mask) * -10000.0
+        # # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+        # # ourselves in which case we just need to make it broadcastable to all heads.
+        # extended_relation_attention_mask = relation_attention_mask[:,None,None,:].to(dtype=self.dtype)
+        # extended_relation_attention_mask = (1.0 - extended_relation_attention_mask) * -10000.0
+        # extended_go_attention_mask = go_attention_mask[:,None,None,:].to(dtype=self.dtype)
+        # extended_go_attention_mask = (1.0 - extended_go_attention_mask) * -10000.0
 
         # import ipdb; ipdb.set_trace()
         # # If a 2D or 3D attention mask is provided for the cross-attention
@@ -747,7 +756,8 @@ class KnowledgeBertModel(BertPreTrainedModel):
         # attention_probs has shape bsz x n_heads x N x N
         # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        # head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -761,20 +771,20 @@ class KnowledgeBertModel(BertPreTrainedModel):
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=None,
-            head_mask=head_mask,
+            # head_mask=head_mask,
             relation_hidden_states=relation_hidden_states,
-            relation_attention_mask=extended_relation_attention_mask,
+            # relation_attention_mask=extended_relation_attention_mask,
             go_hidden_states=go_hidden_states,
-            go_attention_mask=extended_go_attention_mask,
+            # go_attention_mask=extended_go_attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             coordinate_hidden_states=coordinate_hidden_states,
-            coordinate_attention_mask=extended_coordinate_attention_mask,
+            # coordinate_attention_mask=extended_coordinate_attention_mask,
             aa_vec_hidden_states=aa_vec_hidden_states,
-            aa_vec_attention_mask=extended_aa_vec_attention_mask,
+            # aa_vec_attention_mask=extended_aa_vec_attention_mask,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None

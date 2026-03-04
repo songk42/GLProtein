@@ -5,9 +5,6 @@ These steps prepare the environment and required data to run:
 - `run_pretrain_refactor.py` (MLM-only) or
 - `run_pretrain_refactor.py` with `--use_tmvec_loss True` (adds global structure TM-Vec contrastive loss)
 
-> Note: TMVecLoss expects paired batches: `(0,1), (2,3), ...` are positive pairs.
-> This is enforced by `ProteinSeqPairDataset`, which reads a TSV file of paired sequences.
-
 ---
 
 ## (0) Prerequisites
@@ -66,89 +63,80 @@ Pass these paths to `run_pretrain_refactor.py`:
 
 Download UniProt data from https://drive.google.com/file/d/1fsfE8kG6oBJor7tr2RJfOyFGAMj6woVM, decompress it and save it in `/data/pretrain_data`.
 
-Run the following to create the sequence pair TSV file for TM-Vec in `/data/pretrain_data`:
+Run the following to create the TSV and NPY files for TM-Vec in `/data/pretrain_data`:
 ```bash
-# Small-scale testing
 python generate_tmvec_pairs_tsv.py \
   --uniprot_dat data/pretrain_data/uniprot_sprot.dat \
   --out_tsv data/pretrain_data/tmvec_pairs.tsv \
+  --out_emb_npy data/pretrain_data/tmvec_pairs_emb.npy \
   --tmvec_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
   --tmvec_config assets/tmvec/tm_vec_cath_model_params.json \
   --device cuda \
   --max_proteins 500 \
+  --pairs_per_anchor 1 \
   --top_k 5 \
-  --pairs_per_anchor 1 \
-  --encode_batch_size 2
-
-# Full-scale dataset
-python generate_tmvec_pairs_tsv.py \
-  --uniprot_dat data/pretrain_data/uniprot_sprot.dat \
-  --out_tsv data/pretrain_data/tmvec_pairs.tsv \
-  --tmvec_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
-  --tmvec_config assets/tmvec/tm_vec_cath_model_params.json \
-  --device cuda \
-  --max_proteins <SET_AS_PAPER> \
-  --top_k 50 \
-  --pairs_per_anchor 1 \
-  --use_faiss \
-  --encode_batch_size 8
+  --emb_dtype float16
 ```
 
 ---
 
-## (6) Run pretraining (MLM-only)
-
-### (6.1) Quick verification
+## (6) Verify MLM-only pretraining
 
 ```bash
 python run_pretrain_refactor.py \
   --output_dir outputs/mlm_only_quick \
-  --per_device_train_batch_size 2 \
-  --protein_seq_sample_limit 5 \
-  --max_steps 10
-```
-
-### (6.2) Full pretraining
-
-```bash
-python run_pretrain_refactor.py \
-  --output_dir outputs/mlm_only_full \
-  --max_steps <SET_AS_PAPER>
-```
-
----
-
-## (7) Run pretraining with TMVecLoss (global structure)
-
-### (7.1) Quick verification
-```bash
-python run_pretrain_refactor.py \
-  --output_dir outputs/mlm_plus_tmvec_quick \
-  --per_device_train_batch_size 4 \
-  --protein_seq_sample_limit 10 \
   --max_steps 10 \
-  --tmvec_pairs_tsv tmvec_pairs.tsv \
-  --use_tmvec_loss True \
-  --tmvec_model_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
-  --tmvec_model_config_json assets/tmvec/tm_vec_cath_model_params.json \
-  --tmvec_device cpu
-```
-
-### (7.2) Full pretraining
-
-```bash
-python run_pretrain_refactor.py \
-  --output_dir outputs/mlm_plus_tmvec_full \
-  --max_steps <SET_AS_PAPER> \
-  --tmvec_pairs_tsv data/pretrain_data/tmvec_pairs.tsv \
-  --use_tmvec_loss True \
-  --tmvec_model_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
-  --tmvec_model_config_json assets/tmvec/tm_vec_cath_model_params.json \
-  --tmvec_device cuda
+  --per_device_train_batch_size 4 \
+  --protein_seq_sample_limit 5
 ```
 
 ---
 
-## (8) Troubleshooting
+## (7) Verify pretraining with TMVecLoss
+```bash
+python run_pretrain_refactor.py \
+  --output_dir outputs/mlm_plus_tmvec_precomputed \
+  --use_tmvec_loss True \
+  --tmvec_pairs_tsv tmvec_pairs.tsv \
+  --tmvec_pairs_emb_npy tmvec_pairs_emb.npy \
+  --max_steps 10 \
+  --per_device_train_batch_size 4 \
+  --fp16 \
+  --protein_seq_sample_limit 5
+```
+
+---
+
+## (8) Full pretraining
+
+> Note: The following arguments have not been tested.
+
+To prepare the full dataset for TMVecLoss, run `generate_tmvec_pairs_tsv.py` with the following arguments (inferred from the paper):
+```bash
+  --max_proteins 600000 \
+  --pairs_per_anchor 4 \
+  --top_k 5 \
+  --emb_dtype float16
+```
+
+To run full pretraining, run `run_pretrain_refactor.py` with deepspeed (`--num_gpus=4`), without `--protein_seq_sample_limit`, and the following arguments from `run_pretrain.sh`:
+```bash
+  --max_steps 300000 \
+  --per_device_train_batch_size 4 \
+  --weight_decay 0.01 \
+  --optimize_memory True \
+  --gradient_accumulation_steps 256 \
+  --lr_scheduler_type linear \
+  --lm_learning_rate 1e-5 \
+  --lm_warmup_ratio 0.167 \
+  --seed 2021 \
+  --deepspeed dp_config.json \
+  --fp16 \
+  --dataloader_pin_memory
+```
+
+---
+
+## (9) Troubleshooting
 - If you see an error about `sequence` missing, you are not using `ProteinSeqPairDataset` (or your collator did not pass through `sequence`).
 - If you see an error about batch size needing to be even, set `--per_device_train_batch_size` to an even number.
