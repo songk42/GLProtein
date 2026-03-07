@@ -72,71 +72,49 @@ python generate_tmvec_pairs_tsv.py \
   --tmvec_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
   --tmvec_config assets/tmvec/tm_vec_cath_model_params.json \
   --device cuda \
-  --max_proteins 500 \
-  --pairs_per_anchor 1 \
   --top_k 5 \
-  --emb_dtype float16
+  --use_faiss \
+  --seed 2021 \
+  --embed_checkpoint_dir embed_ckpt \
+  --resume_embeddings \
+  --max_proteins 1000
 ```
 
 ---
 
-## (6) Verify MLM-only pretraining
-
-```bash
-python run_pretrain_refactor.py \
-  --output_dir outputs/mlm_only_quick \
-  --max_steps 10 \
-  --per_device_train_batch_size 4 \
-  --protein_seq_sample_limit 5
-```
-
----
-
-## (7) Verify pretraining with TMVecLoss
+## (6) Verify pretraining with TMVecLoss
 ```bash
 python run_pretrain_refactor.py \
   --output_dir outputs/mlm_plus_tmvec_precomputed \
   --use_tmvec_loss True \
   --tmvec_pairs_tsv tmvec_pairs.tsv \
   --tmvec_pairs_emb_npy tmvec_pairs_emb.npy \
-  --max_steps 10 \
-  --per_device_train_batch_size 4 \
-  --fp16 \
-  --protein_seq_sample_limit 5
-```
-
----
-
-## (8) Full pretraining
-
-> Note: The following arguments have not been tested.
-
-To prepare the full dataset for TMVecLoss, run `generate_tmvec_pairs_tsv.py` with the following arguments (inferred from the paper):
-```bash
-  --max_proteins 600000 \
-  --pairs_per_anchor 4 \
-  --top_k 5 \
-  --emb_dtype float16
-```
-
-To run full pretraining, run `run_pretrain_refactor.py` with deepspeed (`--num_gpus=4`), without `--protein_seq_sample_limit`, and the following arguments from `run_pretrain.sh`:
-```bash
-  --max_steps 300000 \
   --per_device_train_batch_size 4 \
   --weight_decay 0.01 \
   --optimize_memory True \
-  --gradient_accumulation_steps 256 \
   --lr_scheduler_type linear \
   --lm_learning_rate 1e-5 \
   --lm_warmup_ratio 0.167 \
   --seed 2021 \
-  --deepspeed dp_config.json \
   --fp16 \
-  --dataloader_pin_memory
+  --dataloader_pin_memory \
+  --max_steps 10 \
+  --gradient_accumulation_steps 2 \
+  --protein_seq_sample_limit 8
 ```
 
 ---
 
-## (9) Troubleshooting
+## (7) Full pretraining
+
+> Note: The following arguments have not been tested.
+
+To prepare the full dataset for TMVecLoss, run `generate_tmvec_pairs_tsv.py` without `--max_proteins`.
+
+To run full pretraining, run `run_pretrain_refactor.py` with `--max_steps 300000`, `--gradient_accumulation_steps 256` and no `--protein_seq_sample_limit`.
+
+---
+
+## (8) Troubleshooting
 - If you see an error about `sequence` missing, you are not using `ProteinSeqPairDataset` (or your collator did not pass through `sequence`).
 - If you see an error about batch size needing to be even, set `--per_device_train_batch_size` to an even number.
