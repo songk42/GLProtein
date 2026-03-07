@@ -14,7 +14,8 @@ from src_refactor.dataloader import DataCollatorForGoGo, DataCollatorForLanguage
 from src_refactor.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
 
 logger = logging.get_logger(__name__)
-DEVICE = 'cpu'
+import torch
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def main():

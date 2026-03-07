@@ -416,56 +416,56 @@ class NonLinear(nn.Module):
         x = self.layer2(x)
         return x
 
-# class Protein3DBias(nn.Module):
-#     """
-#         Compute 3D attention bias according to the position information for each head.
-#         """
+class Protein3DBias(nn.Module):
+    """
+        Compute 3D attention bias according to the position information for each head.
+        """
 
-#     def __init__(self):
-#         super(Protein3DBias, self).__init__()
-#         self.num_heads = 8
-#         self.num_edges = 2
-#         self.num_kernel = 128
-#         self.embed_dim = 512
+    def __init__(self):
+        super(Protein3DBias, self).__init__()
+        self.num_heads = 8
+        self.num_edges = 2
+        self.num_kernel = 128
+        self.embed_dim = 512
 
 
-#         rpe_heads = self.num_heads
-#         self.gbf = GaussianLayer(self.num_kernel, self.num_edges)
-#         self.gbf_proj = NonLinear(self.num_kernel, rpe_heads)
+        rpe_heads = self.num_heads
+        self.gbf = GaussianLayer(self.num_kernel, self.num_edges)
+        self.gbf_proj = NonLinear(self.num_kernel, rpe_heads)
 
-#         if self.num_kernel != self.embed_dim:
-#             self.edge_proj = nn.Linear(self.num_kernel, self.embed_dim)
-#         else:
-#             self.edge_proj = None
+        if self.num_kernel != self.embed_dim:
+            self.edge_proj = nn.Linear(self.num_kernel, self.embed_dim)
+        else:
+            self.edge_proj = None
 
-#     def forward(self, batched_data):
+    def forward(self, batched_data):
 
-#         pos, x, node_type_edge = batched_data['protein_coordinates'], batched_data['protein_input_ids'], batched_data['protein_token_type_ids'] # pos shape: [n_examoles, n_nodes, 3]
-#         # pos.requires_grad_(True)
+        pos, x, node_type_edge = batched_data['protein_coordinates'], batched_data['protein_input_ids'], batched_data['protein_token_type_ids'] # pos shape: [n_examoles, n_nodes, 3]
+        # pos.requires_grad_(True)
 
-#         padding_mask = x.eq(0).all(dim=-1)
-#         n_graph, n_node, _ = pos.shape
-#         delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
-#         dist = delta_pos.norm(dim=-1).view(-1, n_node, n_node)
-#         delta_pos /= dist.unsqueeze(-1) + 1e-5
+        padding_mask = x.eq(0).all(dim=-1)
+        n_graph, n_node, _ = pos.shape
+        delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
+        dist = delta_pos.norm(dim=-1).view(-1, n_node, n_node)
+        delta_pos /= dist.unsqueeze(-1) + 1e-5
 
-#         edge_feature = self.gbf(dist, torch.zeros_like(dist).long() if node_type_edge is None else node_type_edge.long())
-#         gbf_result = self.gbf_proj(edge_feature)
-#         graph_attn_bias = gbf_result
+        edge_feature = self.gbf(dist, torch.zeros_like(dist).long() if node_type_edge is None else node_type_edge.long())
+        gbf_result = self.gbf_proj(edge_feature)
+        graph_attn_bias = gbf_result
 
-#         graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
-#         graph_attn_bias.masked_fill_(
-#             padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
-#         )
+        graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
+        graph_attn_bias.masked_fill_(
+            padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
+        )
 
-#         edge_feature = edge_feature.masked_fill(
-#             padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool), 0.0
-#         )
+        edge_feature = edge_feature.masked_fill(
+            padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool), 0.0
+        )
 
-#         sum_edge_features = edge_feature.sum(dim=-2)
-#         merge_edge_features = self.edge_proj(sum_edge_features)
+        sum_edge_features = edge_feature.sum(dim=-2)
+        merge_edge_features = self.edge_proj(sum_edge_features)
 
-#         return graph_attn_bias, merge_edge_features, delta_pos
+        return graph_attn_bias, merge_edge_features, delta_pos
 
 
 
@@ -616,11 +616,8 @@ class KnowledgeDecoder(BertPreTrainedModel):
         self.go_project = nn.Linear(textbert_config.hidden_size, self.config.hidden_size)
         self.relation_project = nn.Linear(textbert_config.hidden_size, self.config.hidden_size)
         
-        self.coordinate_project = nn.Linear(3, self.config.hidden_size)
+        self.protein3d_bias = Protein3DBias()
         self.aa_vec_project = nn.Linear(300, self.config.hidden_size)
-
-        self.gbf = GaussianLayer(128, 1)
-        self.gbf_proj = NonLinear(128, 512, 1024)
 
         self.text_feat_dim = textbert_config.hidden_size
         self.text_pooler = BertPooler(textbert_config)
@@ -653,31 +650,22 @@ class KnowledgeDecoder(BertPreTrainedModel):
         aa_vec_inputs = None):
         batch, protein_len, protein_embed_size = inputs_embeds.size()
 
-        ### coordinate feature extraction
+        ### local structure encoding via Protein3DBias
 
+        coordinate_input, coordinate_attention_mask = coordinate_inputs
+        aa_vec_input, aa_vec_attention_mask = aa_vec_inputs
 
-        coordinate_input,coordinate_attention_mask = coordinate_inputs 
-        aa_vec_input,aa_vec_attention_mask = aa_vec_inputs
+        # Compute Protein3DBias: graph_attn_bias is Phi_distance [batch, num_heads, n_node, n_node]
+        batched_data = {
+            'protein_coordinates': coordinate_input,
+            'protein_input_ids': coordinate_input,   # used for padding mask via .eq(0).all(dim=-1)
+            'protein_token_type_ids': None,           # use single edge type (zeros)
+        }
+        graph_attn_bias, _, _ = self.protein3d_bias(batched_data)
 
-
-        #get the coordinate mask
-        coordinate_attention_mask = torch.mean(coordinate_input,dim=2)
-        coordinate_attention_mask = torch.where(torch.isinf(coordinate_attention_mask),torch.zeros_like(coordinate_attention_mask),coordinate_attention_mask)
-        coordinate_attention_mask = torch.where(torch.isnan(coordinate_attention_mask),torch.zeros_like(coordinate_attention_mask),coordinate_attention_mask)
-        coordinate_attention_mask = coordinate_attention_mask.bool()
-
-        delta_pos = coordinate_input.unsqueeze(1) - coordinate_input.unsqueeze(2)
-        dist = delta_pos.norm(dim=-1).view(-1, protein_len-2, protein_len-2)
-        delta_pos /= dist.unsqueeze(-1) + 1e-5
-        
-        delta_pos = torch.where(torch.isinf(delta_pos),torch.zeros_like(delta_pos),delta_pos)
-        delta_pos = torch.where(torch.isnan(delta_pos),torch.zeros_like(delta_pos),delta_pos)
-        delta_pos = torch.mean(delta_pos,dim=2)
-        coordinate_feat = self.coordinate_project(delta_pos) #(batch,coordinate len, decoder hidden dim)
-        
-        
-        aa_vec_attention_mask = coordinate_attention_mask
-
+        # Pad graph_attn_bias from [batch, heads, n_node, n_node] to [batch, heads, protein_len, protein_len]
+        # by adding zero bias for the [CLS] (front) and [SEP] (back) special tokens
+        graph_attn_bias = F.pad(graph_attn_bias, (1, 1, 1, 1), value=0.0)
 
         aa_vec_feat = self.aa_vec_project(aa_vec_input) #(batch,aa_vec len, decoder hidden dim)
 
@@ -730,10 +718,9 @@ class KnowledgeDecoder(BertPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            coordinate_hidden_states= coordinate_feat,
-            coordinate_attention_mask= coordinate_attention_mask,
-            aa_vec_hidden_states = aa_vec_feat,
-            aa_vec_attention_mask = aa_vec_attention_mask,
+            graph_attn_bias=graph_attn_bias,
+            aa_vec_hidden_states=aa_vec_feat,
+            aa_vec_attention_mask=aa_vec_attention_mask,
         )
 
 

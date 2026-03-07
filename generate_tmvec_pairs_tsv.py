@@ -126,7 +126,7 @@ def main():
     ap.add_argument("--tmvec_ckpt", required=True, help="TM-Vec checkpoint (.ckpt)")
     ap.add_argument("--tmvec_config", required=True, help="TM-Vec params JSON")
     ap.add_argument("--prot_t5_name", default="Rostlab/prot_t5_xl_uniref50")
-    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu", "mps"])
     ap.add_argument("--max_proteins", type=int, default=2000,
                     help="Limit number of proteins read from UniProt")
     ap.add_argument("--min_len", type=int, default=50)

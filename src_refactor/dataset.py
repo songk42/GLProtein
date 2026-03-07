@@ -141,6 +141,8 @@ class ProteinSeqInputFeatures:
     """
     input_ids: List[int]
     coordinates: Optional[List[List[float]]] = None
+    aa_vec: Optional[List[List[float]]] = None
+    sequence: Optional[str] = None
     label: Optional[Union[int, float]] = None
     
 
@@ -461,26 +463,18 @@ class ProteinSeqDataset(Dataset):
         tokenizer: PreTrainedTokenizerBase = None,
         in_memory: bool=True,
         max_protein_seq_length: int = None,
-        protein_seq_sample_limit: Optional[int] = None
+        protein_seq_sample_limit: Optional[int] = None,
+        coordinates_path: Optional[str] = None,
+        aa_vec_model_path: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.seq_data_path = seq_data_path
 
-        # self.env = lmdb.open(os.path.join(data_dir, seq_data_path), readonly=True)
-        
-        # with self.env.begin(write=False) as txn:
-        #     self.num_examples = pkl.loads(txn.get(b'num_examples'))
-
-        # self.in_memory = in_memory
-        # if in_memory:
-        #     cache = [None] * self.num_examples
-        #     self.cache = cache
-
         def trans_sequence(sequence):
             sequence = " ".join(sequence)
-            sequence = re.sub(r"[UZOB]", "X", sequence) 
+            sequence = re.sub(r"[UZOB]", "X", sequence)
             return sequence
-        
+
         with open(os.path.join(self.data_dir, "uniprot_sprot.dat")) as f:
             records = SwissProt.parse(f)
             if protein_seq_sample_limit is None:
@@ -488,42 +482,88 @@ class ProteinSeqDataset(Dataset):
             else:
                 self.protein_seq = [r.sequence for r in islice(records, protein_seq_sample_limit)]
 
-        
-        # self.protein_seq = [line.rstrip('\n') for line in open(os.path.join(self.data_dir, 'uniprot_sprot.dat'), 'r')]
         self.protein_seq = [trans_sequence(item) for item in self.protein_seq]
 
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
-        # self.protein_cor = pickle.load(open('./ProteinKG25/id2cor_dict.pkl', 'rb'))
+
+        # Load per-residue 3D coordinates if a coordinates pkl is provided.
+        # The pkl should be a dict mapping protein index -> List[List[float]] (one [x,y,z] per residue).
+        self.protein_cor = None
+        if coordinates_path is not None and os.path.exists(coordinates_path):
+            self.protein_cor = pickle.load(open(coordinates_path, 'rb'))
+
+        # Build aa_vec vocabulary if a mol2vec model is provided.
+        # The vocab maps token_id -> 300-dim embedding for each amino acid token.
+        self.aa_vocab = None
+        if aa_vec_model_path is not None and os.path.exists(aa_vec_model_path):
+            aa_smis = ['CC(N)C(=O)O', 'N=C(N)NCCCC(N)C(=O)O', 'NC(=O)CC(N)C(=O)O', 'NC(CC(=O)O)C(=O)O',
+                'NC(CS)C(=O)O', 'NC(CCC(=O)O)C(=O)O', 'NC(=O)CCC(N)C(=O)O', 'NCC(=O)O',
+                'NC(Cc1cnc[nH]1)C(=O)O', 'CCC(C)C(N)C(=O)O', 'CC(C)CC(N)C(=O)O', 'NCCCCC(N)C(=O)O',
+                'CSCCC(N)C(=O)O', 'NC(Cc1ccccc1)C(=O)O', 'O=C(O)C1CCCN1', 'NC(CO)C(=O)O',
+                'CC(O)C(N)C(=O)O', 'NC(Cc1c[nH]c2ccccc12)C(=O)O', 'NC(Cc1ccc(O)cc1)C(=O)O',
+                'CC(C)C(N)C(=O)O','CC1CC=NC1C(=O)NCCCCC(C(=O)O)N','C(C(C(=O)O)N)[Se]']
+            aa_codes = ['A', 'R', 'N', 'D', 'C', 'E', 'Q', 'G', 'H', 'I',
+                        'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', 'O', 'U', 'B', 'Z', 'X']
+            aa_idx_codes = dict(zip(aa_codes, range(len(aa_codes))))
+            aas = [Chem.MolFromSmiles(x) for x in aa_smis]
+            w2v_model = word2vec.Word2Vec.load(aa_vec_model_path)
+            aa_sentences = [mol2alt_sentence(x, 1) for x in aas]
+            aa_vecs = sentences2vec(aa_sentences, w2v_model, unseen='UNK')
+            B_vec = ((aa_vecs[aa_idx_codes['D']] + aa_vecs[aa_idx_codes['N']]) / 2).reshape(1, 300)
+            Z_vec = ((aa_vecs[aa_idx_codes['E']] + aa_vecs[aa_idx_codes['Q']]) / 2).reshape(1, 300)
+            aa_vecs = np.concatenate([aa_vecs, B_vec, Z_vec], axis=0)
+            X_vecs = np.mean(aa_vecs, axis=0).reshape(1, 300)
+            aa_vecs = np.concatenate([aa_vecs, X_vecs], axis=0)
+            self.aa_vocab = {}
+            for token, tok_id in self.tokenizer.get_vocab().items():
+                if token in aa_idx_codes:
+                    self.aa_vocab[tok_id] = {'aa': token, 'vec': list(aa_vecs[aa_idx_codes[token]])}
         
     def __getitem__(self, index):
-        # if self.in_memory and self.cache[index] is not None:
-        #     item = self.cache[index]
-        # else:
-        #     with self.env.begin(write=False) as txn:
-        #         item = pkl.loads(txn.get(str(index).encode()))
-        #     if self.in_memory:
-        #         self.cache[index] = item
         item = self.protein_seq[index]
 
-        # implement padding of sequences at 'DataCollatorForLanguageModeling'
-        # item = list(item)
+        # Truncate to max length before tokenizing so coordinates/aa_vec stay aligned
         if self.max_protein_seq_length is not None:
             tokens = item.split()[:self.max_protein_seq_length]
             item = " ".join(tokens)
+        raw_seq = item.replace(" ", "")  # amino acid characters without spaces
         input_ids = self.tokenizer.encode(item, add_special_tokens=True)
 
-        # cor = self.protein_cor[index]
-        # if self.max_protein_seq_length is not None:
-        #     cor = cor[:self.max_protein_seq_length]
-        # ### coordinates normalize & padding
-        # cor = np.array(cor)-np.array(cor).mean(axis=0)
-        # cor = np.concatenate([np.zeros((1,3)),cor,np.zeros((1,3))],axis=0)
-        # cor = cor.tolist()
+        # --- 3D coordinates ---
+        cor = None
+        if self.protein_cor is not None and index in self.protein_cor:
+            cor = self.protein_cor[index]
+            if self.max_protein_seq_length is not None:
+                cor = cor[:self.max_protein_seq_length]
+            cor = np.array(cor, dtype=float)
+            if cor.any():
+                cor = (cor - cor.mean(axis=0)) / (cor.std(axis=0) + 1e-8)
+            cor = cor.tolist()
+        else:
+            # Fallback: zero coordinates matching the residue count (excluding CLS/SEP)
+            n_residues = len(input_ids) - 2  # subtract [CLS] and [SEP]
+            cor = np.zeros((max(n_residues, 0), 3)).tolist()
+
+        # --- aa_vec (mol2vec per residue) ---
+        aa_vec = None
+        if self.aa_vocab is not None:
+            aa_vec = []
+            aa_vec_padding = np.zeros(300).tolist()
+            for tok_id in input_ids[1:-1]:  # skip [CLS] and [SEP]
+                if tok_id in self.aa_vocab:
+                    aa_vec.append(self.aa_vocab[tok_id]['vec'])
+                else:
+                    aa_vec.append(aa_vec_padding)
+        else:
+            n_residues = len(input_ids) - 2
+            aa_vec = np.zeros((max(n_residues, 0), 300)).tolist()
 
         return ProteinSeqInputFeatures(
             input_ids=input_ids,
-            # coordinates=cor,
+            coordinates=cor,
+            aa_vec=aa_vec,
+            sequence=raw_seq,
         )
         
     def __len__(self):
