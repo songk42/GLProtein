@@ -10,6 +10,7 @@ from src.benchmark.models import model_mapping, load_adam_optimizer_and_schedule
 from src.benchmark.dataset import dataset_mapping, output_modes_mapping
 from src.benchmark.metrics import build_compute_metrics_fn
 from src.benchmark.trainer import OntoProteinTrainer
+from torch.utils.data import Subset
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -101,6 +102,17 @@ class DynamicTrainingArguments(TrainingArguments):
         default=3,
         metadata={"help": "If a value is passed, will limit the total amount of checkpoints."}
     )
+
+    past_index: int = field(
+        default=-1,
+        metadata={"help": "Past index for models that use cached past states. Keep -1 to disable."}
+    )
+
+    overwrite_output_dir: bool = field(
+        default=True,
+        metadata={"help": "Overwrite the content of the output directory"}
+    )
+
     # resume_from_checkpoint = True
     fp16 = True
 
@@ -143,11 +155,11 @@ def main():
     ):
         raise ValueError(f"Output directory ({training_args.output_dir}) already exists.")
     logger.warning(
-        "Process rank: %s, device: %s, n_gpu: %s",
+        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s",
         training_args.local_rank,
         DEVICE,
         training_args.n_gpu,
-        bool(training_args.local_rank != -1)
+        bool(training_args.local_rank != -1),
     )
 
     logger.info("Training/evaluation parameters %s", training_args)
@@ -161,20 +173,30 @@ def main():
         raise ValueError("Task not found: %s" % (data_args.task_name))
 
     # Load dataset
+    tokenizer_path = model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path
+    if os.path.exists(tokenizer_path) or tokenizer_path.startswith('.') or tokenizer_path.startswith('/'):
+        tokenizer_path = os.path.abspath(tokenizer_path)
+
     tokenizer = BertTokenizerFast.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        tokenizer_path,
         do_lower_case=False
     )
     processor = dataset_mapping[data_args.task_name](tokenizer=tokenizer)
     # For classification task, num labels is determined by specific tasks
     # For regression task, num labels is 1.
     num_labels = len(processor.get_labels())
-    train_dataset = (
-        processor.get_train_examples(data_dir=data_args.data_dir)
+    train_dataset = processor.get_train_examples(data_dir=data_args.data_dir)
+    train_dataset = Subset(
+        train_dataset,
+        sorted(range(len(train_dataset)), key=lambda i: len(train_dataset[i][0]))[:20]
     )
-    eval_dataset = (
-        processor.get_dev_examples(data_dir=data_args.data_dir)
+
+    eval_dataset = processor.get_dev_examples(data_dir=data_args.data_dir)
+    eval_dataset = Subset(
+        eval_dataset,
+        sorted(range(len(eval_dataset)), key=lambda i: len(eval_dataset[i][0]))[:10]
     )
+
     if data_args.task_name == 'remote_homology':
         test_fold_dataset = (
             processor.get_test_examples(data_dir=data_args.data_dir, data_cat='test_fold_holdout')
@@ -206,7 +228,8 @@ def main():
     model = model_fn.from_pretrained(
         model_args.model_name_or_path,
         num_labels=num_labels,
-        mean_output=model_args.mean_output
+        mean_output=model_args.mean_output,
+        ignore_mismatched_sizes=True
     )
 
     if model_args.frozen_bert:
@@ -235,7 +258,7 @@ def main():
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             compute_metrics=build_compute_metrics_fn(data_args.task_name, output_type=output_mode),
-            data_collator=train_dataset.collate_fn,
+            data_collator=train_dataset.dataset.collate_fn,
             optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None)
         )
     else:
@@ -245,7 +268,7 @@ def main():
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             compute_metrics=build_compute_metrics_fn(data_args.task_name, output_type=output_mode),
-            data_collator=train_dataset.collate_fn,
+            data_collator=train_dataset.dataset.collate_fn,
             optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None)
         )
 

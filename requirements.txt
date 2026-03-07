@@ -7,3 +7,5 @@ mol2vec
 rdkit
 biopython
 accelerate
+tape-proteins
+seqeval

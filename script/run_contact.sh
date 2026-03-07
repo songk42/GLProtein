@@ -1,5 +1,8 @@
-nohup sh run_main.sh \
-      --model output/pretrained/GLProtein/encoder \
+mkdir -p ../trainer_output/contact/log
+
+nohup sh ../run_main.sh \
+      --model "../trainer_output/checkpoint-3/encoder" \
+      --tokenizer_name "Rostlab/prot_bert" \
       --output_file contact-GLProtein \
       --task_name contact \
       --do_train True \
@@ -12,4 +15,4 @@ nohup sh run_main.sh \
       --warmup_ratio 0.08 \
       --learning_rate 3e-5 \
       --seed 3 \
-      --frozen_bert False > output/contact/GLProtein.out 2>&1
+      --frozen_bert False > ../trainer_output/contact/log/GLProtein.out 2>&1

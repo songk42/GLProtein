@@ -1,5 +1,8 @@
-nohup sh run_main.sh \
-      --model output/models/GLProtein/encoder \
+mkdir -p ../trainer_output/ss8/log
+
+nohup sh ../run_main.sh \
+      --model "../trainer_output/checkpoint-3/encoder" \
+      --tokenizer_name "Rostlab/prot_bert" \
       --output_file ss8-GLProtein \
       --task_name ss8 \
       --do_train True \
@@ -12,4 +15,4 @@ nohup sh run_main.sh \
       --warmup_ratio 0.08 \
       --learning_rate 3e-5 \
       --seed 3 \
-      --frozen_bert False > output/ss8/GLProtein.out 2>&1
+      --frozen_bert False > ../trainer_output/ss8/log/GLProtein.out 2>&1

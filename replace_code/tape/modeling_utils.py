@@ -30,7 +30,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .file_utils import cached_path
+from tape.models.file_utils import cached_path
 
 CONFIG_NAME = "config.json"
 WEIGHTS_NAME = "pytorch_model.bin"

@@ -1,11 +1,11 @@
-from tape.models.modeling_utils import PairwiseContactPredictionHead
+from replace_code.tape.modeling_utils import PairwiseContactPredictionHead
 from torch import nn, pdist, Tensor
 from torch.nn import MSELoss, CrossEntropyLoss, BCEWithLogitsLoss
 from torch.nn.modules.loss import _Loss
 from torch.nn.utils.weight_norm import weight_norm
 from torch.utils.data import Dataset
-from transformers import BertPreTrainedModel, BertModel, AdamW, \
-    get_linear_schedule_with_warmup
+from transformers import BertPreTrainedModel, BertModel, get_linear_schedule_with_warmup
+from torch.optim import AdamW
 
 import numpy as np
 import torch
@@ -40,6 +40,10 @@ class BertForOntoProteinContactPrediction(BertPreTrainedModel):
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.mean_output = mean_output
         self.init_weights()
+
+    @property
+    def all_tied_weights_keys(self):
+        return {}
 
     def forward(self, input_ids, protein_length, attention_mask=None, labels=None, invalid_mask=None):
         targets = labels
@@ -164,6 +168,10 @@ class BertForTokenClassification2(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.mean_output = mean_output
+
+    @property
+    def all_tied_weights_keys(self):
+        return {}
 
     def forward(
             self,

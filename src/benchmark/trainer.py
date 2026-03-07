@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
 from torch.utils.data import IterableDataset, DataLoader
-from transformers import Trainer, EvalPrediction, is_torch_tpu_available
+from transformers import Trainer, EvalPrediction
+from transformers.utils import is_torch_xla_available
 from transformers.trainer_pt_utils import find_batch_size, nested_numpify
 from transformers.trainer_utils import EvalLoopOutput, denumpify_detensorize, PredictionOutput
 import numpy as np
@@ -89,7 +90,7 @@ class OntoProteinTrainer(Trainer):
         #labels_host: Union[torch.Tensor, List[torch.Tensor]] = None
 
         world_size = 1
-        if is_torch_tpu_available():
+        if is_torch_xla_available():
             world_size = xm.xrt_world_size()
         elif self.args.local_rank != -1:
             world_size = torch.distributed.get_world_size()
@@ -101,7 +102,7 @@ class OntoProteinTrainer(Trainer):
 
         model.eval()
 
-        if is_torch_tpu_available():
+        if is_torch_xla_available():
             dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
 
         if self.args.past_index >= 0:
@@ -118,7 +119,9 @@ class OntoProteinTrainer(Trainer):
             contact_meterics_l2.append(torch.mean(prediction_score['precision_at_l2']))
             contact_meterics_l.append(torch.mean(prediction_score['precision_at_l']))
             if loss is not None:
-                losses = loss.repeat(batch_size)
+                effective_batch_size = find_batch_size(inputs)
+                effective_batch_size = effective_batch_size if effective_batch_size is not None else 1
+                losses = loss.repeat(effective_batch_size)
                 losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
 
             self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
@@ -196,7 +199,7 @@ class OntoProteinTrainer(Trainer):
         # Do this before wrapping.
         eval_dataset = dataloader.dataset
 
-        if is_torch_tpu_available():
+        if is_torch_xla_available():
             dataloader = pl.ParallelLoader(dataloader, [self.args.device]).per_device_loader(self.args.device)
 
         if self.args.past_index >= 0:
@@ -226,7 +229,8 @@ class OntoProteinTrainer(Trainer):
             contact_meterics_l.append(torch.mean(prediction_score['precision_at_l']))
             # Update containers on host
             if loss is not None:
-                losses = self._nested_gather(loss.repeat(batch_size))
+                effective_batch_size = observed_batch_size if observed_batch_size is not None else 1
+                losses = self.gather_function(loss.repeat(effective_batch_size))
                 losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
 
             self.control = self.callback_handler.on_prediction_step(self.args, self.state, self.control)
