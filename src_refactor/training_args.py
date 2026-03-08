@@ -349,6 +349,15 @@ class DataArguments:
         metadata={"help": "Optional limit on number of protein sequence examples loaded."}
     )
 
+    coordinates_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pickle file mapping protein index -> list of [x,y,z] alpha-C coordinates (from AlphaFoldDB)."}
+    )
+    aa_vec_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pretrained mol2vec Word2Vec model file (model_300dim.pkl) for amino acid substructure embeddings."}
+    )
+
     # negative sampling
     negative_sampling_fn: str = field(
         default="simple_random",
