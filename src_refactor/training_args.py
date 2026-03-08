@@ -233,6 +233,11 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Whether or not to use adafactor optimizer."}
     )
 
+    save_steps: int = field(
+        default=0,
+        metadata={"help": "Save a checkpoint every N optimizer steps. 0 disables mid-training saves (a final checkpoint is always saved at the end)."}
+    )
+
     def __post_init__(self):
         super().__post_init__()
 
