@@ -1,5 +1,6 @@
 import argparse
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -150,6 +151,29 @@ def _emb_ckpt_paths(embed_checkpoint_dir: str) -> Tuple[str, str]:
     return emb_path, meta_path
 
 
+def build_length_buckets(seqs: List[str]) -> Tuple[List[int], np.ndarray]:
+    order = sorted(range(len(seqs)), key=lambda i: (len(seqs[i]), i))
+    inverse = np.empty(len(seqs), dtype=np.int64)
+    for sorted_pos, orig_idx in enumerate(order):
+        inverse[sorted_pos] = orig_idx
+    return order, inverse
+
+
+def fingerprint_sequences(seqs: List[str]) -> str:
+    h = hashlib.sha256()
+    h.update(str(len(seqs)).encode())
+    total_len = 0
+    for i, s in enumerate(seqs):
+        slen = len(s)
+        total_len += slen
+        if i < 8 or i >= max(0, len(seqs) - 8):
+            h.update(f"{i}:{slen}:{s[:16]}:{s[-16:]}|".encode())
+        else:
+            h.update(f"{i}:{slen}|".encode())
+    h.update(str(total_len).encode())
+    return h.hexdigest()
+
+
 @torch.no_grad()
 def encode_in_batches_checkpointed(
     seqs: List[str],
@@ -162,30 +186,47 @@ def encode_in_batches_checkpointed(
     checkpoint_dir: Optional[str],
     resume_embeddings: bool,
     emb_dim: int = 512,
+    checkpoint_sync_every: int = 10,
+    disable_length_bucketing: bool = False,
 ) -> np.ndarray:
     num_seqs = len(seqs)
+    order, inverse = build_length_buckets(seqs)
+    if disable_length_bucketing:
+        order = list(range(num_seqs))
+        inverse = np.arange(num_seqs, dtype=np.int64)
+        log("Preserving original sequence order for encoding")
+    else:
+        log("Using sequence length bucketing for encoding")
+
+    seqs_sorted = [seqs[i] for i in order]
+    seq_fingerprint = fingerprint_sequences(seqs)
     num_batches = math.ceil(num_seqs / batch_size)
+    sync_every = max(1, checkpoint_sync_every)
     t0 = time.time()
 
     if not checkpoint_dir:
-        embs: List[np.ndarray] = []
+        embs_sorted: List[np.ndarray] = []
         for batch_idx, i in enumerate(range(0, num_seqs, batch_size), start=1):
-            batch = seqs[i:i + batch_size]
+            batch = seqs_sorted[i:i + batch_size]
             b0 = time.time()
             out = encode(batch, tmvec_model, t5, tok, device)
             out = np.asarray(out, dtype=np.float32)
-            embs.append(out)
+            embs_sorted.append(out)
             if batch_idx == 1 or batch_idx == num_batches or (log_every and batch_idx % log_every == 0):
                 elapsed = time.time() - t0
                 avg_per_batch = elapsed / batch_idx
                 eta = avg_per_batch * (num_batches - batch_idx)
+                batch_lens = [len(x) for x in batch]
                 log(
-                    f"Batch {batch_idx}/{num_batches} | "
-                    f"seqs {min(i + len(batch), num_seqs)}/{num_seqs} | "
+                    f"Batch {batch_idx}/{num_batches} | sorted_seqs {min(i + len(batch), num_seqs)}/{num_seqs} | "
+                    f"len[min/med/max]={min(batch_lens)}/{int(np.median(batch_lens))}/{max(batch_lens)} | "
                     f"last_batch={time.time() - b0:.2f}s | avg_batch={avg_per_batch:.2f}s | "
                     f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)} | {cuda_mem_str()}"
                 )
-        return np.concatenate(embs, axis=0)
+        embs_sorted_arr = np.concatenate(embs_sorted, axis=0)
+        embs = np.empty_like(embs_sorted_arr)
+        embs[inverse] = embs_sorted_arr
+        return embs
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     emb_path, meta_path = _emb_ckpt_paths(checkpoint_dir)
@@ -197,6 +238,8 @@ def encode_in_batches_checkpointed(
             "num_seqs": num_seqs,
             "batch_size": batch_size,
             "emb_dim": emb_dim,
+            "sequence_fingerprint": seq_fingerprint,
+            "disable_length_bucketing": disable_length_bucketing,
         }
         for k, v in expected.items():
             if meta.get(k) != v:
@@ -204,10 +247,10 @@ def encode_in_batches_checkpointed(
                     f"Embedding checkpoint mismatch for {k}: current run expects {v!r} but got {meta.get(k)!r}"
                 )
         start_batch = int(meta.get("completed_batches", 0))
-        log(f"Resuming embeddings from batch {start_batch + 1}/{num_batches}")
+        log(f"Resuming embeddings from batch {start_batch + 1}/{num_batches} at {checkpoint_dir}")
         embs_mm = np.memmap(emb_path, dtype=np.float32, mode="r+", shape=(num_seqs, emb_dim))
     else:
-        log("Creating new embedding checkpoint")
+        log(f"Creating new embedding checkpoint store at {checkpoint_dir}")
         embs_mm = np.memmap(emb_path, dtype=np.float32, mode="w+", shape=(num_seqs, emb_dim))
         _write_json(
             meta_path,
@@ -219,17 +262,21 @@ def encode_in_batches_checkpointed(
                 "completed_seqs": 0,
                 "dtype": "float32",
                 "created_at": _now(),
+                "sync_every": sync_every,
+                "sequence_fingerprint": seq_fingerprint,
+                "disable_length_bucketing": disable_length_bucketing,
             },
         )
 
+    batches_since_sync = 0
     for batch_idx, i in enumerate(range(0, num_seqs, batch_size), start=1):
         batch_end = min(i + batch_size, num_seqs)
         if batch_idx <= start_batch:
             if batch_idx == start_batch:
-                log(f"Skipped already-checkpointed batches through {batch_end}/{num_seqs} sequences")
+                log(f"Skipped already-checkpointed batches through {batch_end}/{num_seqs} sorted sequences")
             continue
 
-        batch = seqs[i:batch_end]
+        batch = seqs_sorted[i:batch_end]
         b0 = time.time()
         out = encode(batch, tmvec_model, t5, tok, device)
         out = np.asarray(out, dtype=np.float32)
@@ -238,36 +285,47 @@ def encode_in_batches_checkpointed(
                 f"Unexpected embedding shape from encode(): got {out.shape}, expected ({len(batch)}, {emb_dim})"
             )
         embs_mm[i:batch_end] = out
-        embs_mm.flush()
-        _write_json(
-            meta_path,
-            {
-                "num_seqs": num_seqs,
-                "batch_size": batch_size,
-                "emb_dim": emb_dim,
-                "completed_batches": batch_idx,
-                "completed_seqs": batch_end,
-                "dtype": "float32",
-                "updated_at": _now(),
-            },
-        )
+        batches_since_sync += 1
+
+        should_sync = (batches_since_sync >= sync_every) or (batch_idx == num_batches)
+        if should_sync:
+            embs_mm.flush()
+            _write_json(
+                meta_path,
+                {
+                    "num_seqs": num_seqs,
+                    "batch_size": batch_size,
+                    "emb_dim": emb_dim,
+                    "completed_batches": batch_idx,
+                    "completed_seqs": batch_end,
+                    "dtype": "float32",
+                    "updated_at": _now(),
+                    "sync_every": sync_every,
+                    "sequence_fingerprint": seq_fingerprint,
+                    "disable_length_bucketing": disable_length_bucketing,
+                },
+            )
+            batches_since_sync = 0
 
         if batch_idx == 1 or batch_idx == num_batches or (log_every and batch_idx % log_every == 0):
-            effective_done = batch_idx
             elapsed = time.time() - t0
-            avg_per_batch = elapsed / max(1, effective_done - start_batch)
-            remaining = num_batches - batch_idx
-            eta = avg_per_batch * remaining
+            completed_since_resume = max(1, batch_idx - start_batch)
+            avg_per_batch = elapsed / completed_since_resume
+            eta = avg_per_batch * (num_batches - batch_idx)
+            batch_lens = [len(x) for x in batch]
             log(
-                f"Batch {batch_idx}/{num_batches} | "
-                f"seqs {batch_end}/{num_seqs} | "
+                f"Batch {batch_idx}/{num_batches} | sorted_seqs {batch_end}/{num_seqs} | "
+                f"len[min/med/max]={min(batch_lens)}/{int(np.median(batch_lens))}/{max(batch_lens)} | "
                 f"last_batch={time.time() - b0:.2f}s | avg_batch={avg_per_batch:.2f}s | "
-                f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)} | checkpointed | {cuda_mem_str()}"
+                f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)} | "
+                f"sync_every={sync_every} | {cuda_mem_str()}"
             )
 
-    final = np.array(embs_mm, dtype=np.float32, copy=True)
+    embs_sorted = np.array(embs_mm, dtype=np.float32, copy=True)
     del embs_mm
-    return final
+    embs = np.empty_like(embs_sorted)
+    embs[inverse] = embs_sorted
+    return embs
 
 
 def build_index(
@@ -378,6 +436,8 @@ def main():
     ap.add_argument("--tmvec_half", action="store_true", help="Whether to cast TM-Vec model to float16 on CUDA (currently disabled)")
     ap.add_argument("--embed_checkpoint_dir", default=None, help="Directory for embedding checkpoint")
     ap.add_argument("--resume_embeddings", action="store_true", help="Resume from existing embedding checkpoint")
+    ap.add_argument("--embed_checkpoint_sync_every", type=int, default=10, help="Flush embedding checkpoint to disk every N batches")
+    ap.add_argument("--disable_length_bucketing", action="store_true", help="Disable sequence length bucketing during embedding")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sequence_log_every", type=int, default=50000, help="Log every N accepted sequences while reading UniProt")
     ap.add_argument("--encode_log_every", type=int, default=25, help="Log every N encode batches")
@@ -435,6 +495,8 @@ def main():
         checkpoint_dir=args.embed_checkpoint_dir,
         resume_embeddings=args.resume_embeddings,
         emb_dim=512,
+        checkpoint_sync_every=args.embed_checkpoint_sync_every,
+        disable_length_bucketing=args.disable_length_bucketing,
     )
     log(f"Embeddings shape: {embs.shape} | encode_time={format_seconds(time.time() - enc_t0)}")
 
