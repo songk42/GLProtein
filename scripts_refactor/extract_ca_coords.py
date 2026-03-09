@@ -17,12 +17,17 @@ When `--key-mode tsv_id` is used, the extractor reads the FASTA headers and
 maps AlphaFold/structure accessions back to the raw FASTA ID tokens written by
 `generate_tmvec_pairs_tsv.py` into anchor_id / positive_id / negative_id.
 
+When `--triplets-tsv` is provided, the extractor further restricts work to files whose
+mapped TSV ID appears in the training TSV's `anchor_id` column. This is useful when
+the FASTA covers more proteins than are actually used as anchors during training.
+
 Usage:
     python scripts_refactor/extract_ca_coords.py \
         --input-dir /path/to/structures \
         --output /path/to/coordinates.pkl \
         --key-mode tsv_id \
         --fasta /path/to/swissprot.fasta \
+        --triplets-tsv /path/to/swissprot_triplets.tsv \
         --resume
 """
 
@@ -92,6 +97,22 @@ def stem_to_accession(path: Path) -> str:
     stem = path.name.removesuffix(".gz")
     stem = Path(stem).stem
     return parse_accession(stem)
+
+
+def read_triplet_anchor_ids(path: Path) -> set[str]:
+    import csv
+
+    anchor_ids: set[str] = set()
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="	")
+        if reader.fieldnames is None or "anchor_id" not in reader.fieldnames:
+            raise ValueError(f"Triplet TSV {path} must contain an 'anchor_id' column")
+        for row_idx, row in enumerate(reader, start=2):
+            anchor_id = (row.get("anchor_id") or "").strip()
+            if not anchor_id:
+                raise ValueError(f"Triplet TSV {path} has empty anchor_id at row {row_idx}")
+            anchor_ids.add(anchor_id)
+    return anchor_ids
 
 
 def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = None) -> list[list[float]]:
@@ -187,16 +208,25 @@ def file_priority(path: Path) -> tuple[int, str]:
     return (rank, name)
 
 
-def prefilter_tsv_files(files: list[Path], accession_to_tsv_id: dict[str, str]) -> tuple[list[Path], int]:
+def prefilter_tsv_files(
+    files: list[Path],
+    accession_to_tsv_id: dict[str, str],
+    allowed_tsv_ids: set[str] | None = None,
+) -> tuple[list[Path], int, int]:
     kept: list[Path] = []
-    pre_skipped = 0
+    pre_skipped_not_in_fasta = 0
+    pre_skipped_not_in_anchors = 0
     for path in files:
         accession = stem_to_accession(path)
-        if accession in accession_to_tsv_id:
-            kept.append(path)
-        else:
-            pre_skipped += 1
-    return kept, pre_skipped
+        tsv_id = accession_to_tsv_id.get(accession)
+        if tsv_id is None:
+            pre_skipped_not_in_fasta += 1
+            continue
+        if allowed_tsv_ids is not None and tsv_id not in allowed_tsv_ids:
+            pre_skipped_not_in_anchors += 1
+            continue
+        kept.append(path)
+    return kept, pre_skipped_not_in_fasta, pre_skipped_not_in_anchors
 
 
 def dedupe_tsv_files(files: list[Path]) -> tuple[list[Path], int, list[str]]:
@@ -250,6 +280,7 @@ def checkpoint_state(
     overwrite_examples: list[str],
     total_candidate_files: int,
     pre_skipped: int,
+    pre_skipped_not_in_anchors: int,
     dedup_dropped: int,
     started_at: float,
 ) -> dict[str, Any]:
@@ -263,6 +294,7 @@ def checkpoint_state(
         "overwrite_examples": list(overwrite_examples),
         "total_candidate_files": int(total_candidate_files),
         "pre_skipped": int(pre_skipped),
+        "pre_skipped_not_in_anchors": int(pre_skipped_not_in_anchors),
         "dedup_dropped": int(dedup_dropped),
         "started_at": float(started_at),
     }
@@ -283,6 +315,12 @@ def main():
         type=Path,
         default=None,
         help="Optional FASTA used to map structure accessions back to raw FASTA ID tokens",
+    )
+    parser.add_argument(
+        "--triplets-tsv",
+        type=Path,
+        default=None,
+        help="Optional triplet TSV; when provided with --key-mode tsv_id, only anchor_id entries used by training are extracted",
     )
     parser.add_argument(
         "--index-map",
@@ -333,6 +371,7 @@ def main():
 
     accession_to_tsv_id = None
     pre_skipped = 0
+    pre_skipped_not_in_anchors = 0
     dedup_dropped = 0
     dedup_examples: list[str] = []
     if args.key_mode == "tsv_id":
@@ -351,10 +390,19 @@ def main():
             print(
                 f"[warn] duplicate accessions in FASTA; keeping first mapping for {len(duplicate_accessions)} accession(s)"
             )
-        files, pre_skipped = prefilter_tsv_files(files, accession_to_tsv_id)
+        allowed_anchor_ids = None
+        if args.triplets_tsv is not None:
+            allowed_anchor_ids = read_triplet_anchor_ids(args.triplets_tsv)
+            print(
+                f"[info] loaded {len(allowed_anchor_ids)} unique anchor_id entries from {args.triplets_tsv}"
+            )
+        files, pre_skipped, pre_skipped_not_in_anchors = prefilter_tsv_files(
+            files, accession_to_tsv_id, allowed_tsv_ids=allowed_anchor_ids
+        )
         print(
             f"[info] prefiltered files for tsv_id: keeping {len(files)} / {total_found}, "
             f"pre-skipped {pre_skipped} not in FASTA map"
+            + (f", pre-skipped {pre_skipped_not_in_anchors} not used as TSV anchors" if allowed_anchor_ids is not None else "")
         )
         files, dedup_dropped, dedup_examples = dedupe_tsv_files(files)
         print(
@@ -390,6 +438,7 @@ def main():
             overwrite_examples = list(state.get("overwrite_examples", []))
             ck_total_candidate = state.get("total_candidate_files")
             ck_pre_skipped = state.get("pre_skipped")
+            ck_pre_skipped_not_in_anchors = state.get("pre_skipped_not_in_anchors")
             ck_dedup_dropped = state.get("dedup_dropped")
             if ck_total_candidate is not None and int(ck_total_candidate) != total_candidate_files:
                 print(
@@ -398,6 +447,10 @@ def main():
             if ck_pre_skipped is not None and int(ck_pre_skipped) != pre_skipped:
                 print(
                     f"[warn] checkpoint pre-skipped count {ck_pre_skipped} differs from current {pre_skipped}; continuing with current file list"
+                )
+            if ck_pre_skipped_not_in_anchors is not None and int(ck_pre_skipped_not_in_anchors) != pre_skipped_not_in_anchors:
+                print(
+                    f"[warn] checkpoint anchor-prefilter count {ck_pre_skipped_not_in_anchors} differs from current {pre_skipped_not_in_anchors}; continuing with current file list"
                 )
             if ck_dedup_dropped is not None and int(ck_dedup_dropped) != dedup_dropped:
                 print(
@@ -490,6 +543,7 @@ def main():
                     overwrite_examples=overwrite_examples,
                     total_candidate_files=total_candidate_files,
                     pre_skipped=pre_skipped,
+                    pre_skipped_not_in_anchors=pre_skipped_not_in_anchors,
                     dedup_dropped=dedup_dropped,
                     started_at=started_at,
                 ),
@@ -506,7 +560,7 @@ def main():
         )
 
     print(
-        f"[done] total_found={total_found} | pre_skipped={pre_skipped} | dedup_dropped={dedup_dropped} | "
+        f"[done] total_found={total_found} | pre_skipped_not_in_fasta={pre_skipped} | pre_skipped_not_in_anchors={pre_skipped_not_in_anchors} | dedup_dropped={dedup_dropped} | "
         f"processed={processed_count}/{total_candidate_files} | saved_new={saved_new} overwritten={overwritten} "
         f"skipped={skipped} failed={len(failed)} | unique_keys={len(result)} | elapsed={elapsed:.1f}s"
     )
