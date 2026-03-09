@@ -9,3 +9,5 @@ biopython
 accelerate
 tape-proteins
 seqeval
+tmtools
+faiss-cpu

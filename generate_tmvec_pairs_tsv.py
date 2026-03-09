@@ -1,575 +1,660 @@
 import argparse
+import csv
 import gzip
 import hashlib
+import io
 import json
-import math
+import logging
 import os
 import random
-import sys
+import subprocess
+import tarfile
+import tempfile
 import time
-from typing import Iterator, List, Optional, Tuple
+from collections import OrderedDict
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
-from transformers import T5EncoderModel, T5Tokenizer
-
-try:
-    from tm_vec.embed_structure_model import trans_basic_block, trans_basic_block_Config
-    from tm_vec.tm_vec_utils import encode
-except Exception:
-    raise ImportError("Failed to import tm_vec")
-
-try:
-    import faiss
-    _HAVE_FAISS = True
-except Exception:
-    _HAVE_FAISS = False
 
 
-def _now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def log(msg: str) -> None:
-    print(f"[{_now()}] {msg}", flush=True)
-
-
-def format_seconds(seconds: float) -> str:
-    if not math.isfinite(seconds) or seconds < 0:
-        return "?"
-    seconds = int(round(seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-def cuda_mem_str() -> str:
-    if not torch.cuda.is_available():
-        return "cuda=n/a"
-    try:
-        device = torch.cuda.current_device()
-        alloc = torch.cuda.memory_allocated(device) / (1024 ** 3)
-        reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
-        total = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-        return f"cuda_alloc={alloc:.2f}GB reserved={reserved:.2f}GB total={total:.2f}GB"
-    except Exception:
-        return "cuda=unavailable"
-
-
-def resolve_torch_dtype(model_dtype: str, device: str, tmvec_half: bool):
-    if model_dtype == "auto":
-        if device == "cuda" and tmvec_half:
-            return torch.float16
-        return torch.float32
-    if model_dtype == "float16":
-        return torch.float16
-    return torch.float32
-
-
-def iter_uniprot_sequences(dat_path: str) -> Iterator[str]:
-    opener = gzip.open if dat_path.endswith(".gz") else open
-    with opener(dat_path, "rt", encoding="utf-8", errors="ignore") as f:
-        in_seq = False
-        seq_parts: List[str] = []
-        for line in f:
-            if line.startswith("SQ   SEQUENCE"):
-                in_seq = True
-                seq_parts = []
-                continue
-            if in_seq:
-                if line.startswith("//"):
-                    seq = "".join(seq_parts).replace(" ", "").replace("\n", "")
-                    if seq:
-                        yield seq
-                    in_seq = False
-                    seq_parts = []
-                else:
-                    letters = "".join([c for c in line if c.isalpha()])
-                    if letters:
-                        seq_parts.append(letters)
-
-
-def load_tmvec_models(
-    ckpt: str,
-    config_json: str,
-    prot_t5_name: str,
-    device: str,
-    model_dtype: str,
-    tmvec_half: bool,
-):
-    torch_dtype = resolve_torch_dtype(model_dtype, device, tmvec_half)
-
-    log("Loading TM-Vec config")
-    cfg = trans_basic_block_Config.from_json(config_json)
-
-    log("Loading TM-Vec checkpoint")
-    tmvec_model = trans_basic_block.load_from_checkpoint(ckpt, config=cfg)
-    if tmvec_half and device == "cuda":
-        log("Keeping TM-Vec in float32 for compatibility")
-    tmvec_model = tmvec_model.to(device)
-    log(f"TM-Vec loaded | dtype={next(tmvec_model.parameters()).dtype} | {cuda_mem_str()}")
-
-    log("Loading ProtT5 encoder")
-    t5_kwargs = {}
-    if device == "cuda":
-        t5_kwargs["torch_dtype"] = torch_dtype
-        t5_kwargs["low_cpu_mem_usage"] = True
-    t5 = T5EncoderModel.from_pretrained(prot_t5_name, **t5_kwargs).to(device)
-    if device == "cuda" and torch_dtype == torch.float16:
-        t5 = t5.half()
-    log(f"ProtT5 loaded | dtype={next(t5.parameters()).dtype} | {cuda_mem_str()}")
-
-    tok = T5Tokenizer.from_pretrained(prot_t5_name, do_lower_case=False)
-    if not hasattr(tok, "batch_encode_plus"):
-        tok.batch_encode_plus = tok.__call__
-
-    tmvec_model.eval()
-    t5.eval()
-    return tmvec_model, t5, tok
-
-
-def _write_json(path: str, payload: dict) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
-
-
-def _read_json(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _emb_ckpt_paths(embed_checkpoint_dir: str) -> Tuple[str, str]:
-    emb_path = os.path.join(embed_checkpoint_dir, "embeddings.float32.npy")
-    meta_path = os.path.join(embed_checkpoint_dir, "checkpoint_meta.json")
-    return emb_path, meta_path
-
-
-def build_length_buckets(seqs: List[str]) -> Tuple[List[int], np.ndarray]:
-    order = sorted(range(len(seqs)), key=lambda i: (len(seqs[i]), i))
-    inverse = np.empty(len(seqs), dtype=np.int64)
-    for sorted_pos, orig_idx in enumerate(order):
-        inverse[sorted_pos] = orig_idx
-    return order, inverse
-
-
-def fingerprint_sequences(seqs: List[str]) -> str:
+def sha256_file(path: str) -> str:
     h = hashlib.sha256()
-    h.update(str(len(seqs)).encode())
-    total_len = 0
-    for i, s in enumerate(seqs):
-        slen = len(s)
-        total_len += slen
-        if i < 8 or i >= max(0, len(seqs) - 8):
-            h.update(f"{i}:{slen}:{s[:16]}:{s[-16:]}|".encode())
-        else:
-            h.update(f"{i}:{slen}|".encode())
-    h.update(str(total_len).encode())
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
     return h.hexdigest()
 
 
-@torch.no_grad()
-def encode_in_batches_checkpointed(
-    seqs: List[str],
-    tmvec_model,
-    t5,
-    tok,
-    device: str,
-    batch_size: int,
-    log_every: int,
-    checkpoint_dir: Optional[str],
-    resume_embeddings: bool,
-    emb_dim: int = 512,
-    checkpoint_sync_every: int = 10,
-    disable_length_bucketing: bool = False,
-) -> np.ndarray:
-    num_seqs = len(seqs)
-    order, inverse = build_length_buckets(seqs)
-    if disable_length_bucketing:
-        order = list(range(num_seqs))
-        inverse = np.arange(num_seqs, dtype=np.int64)
-        log("Preserving original sequence order for encoding")
-    else:
-        log("Using sequence length bucketing for encoding")
+def read_fasta(path: str) -> Tuple[List[str], List[str]]:
+    ids, seqs = [], []
+    cur_id, cur = None, []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                if cur_id is not None:
+                    ids.append(cur_id)
+                    seqs.append(''.join(cur))
+                cur_id = line[1:].split()[0]
+                cur = []
+            else:
+                cur.append(line)
+    if cur_id is not None:
+        ids.append(cur_id)
+        seqs.append(''.join(cur))
+    return ids, seqs
 
-    seqs_sorted = [seqs[i] for i in order]
-    seq_fingerprint = fingerprint_sequences(seqs)
-    num_batches = math.ceil(num_seqs / batch_size)
-    sync_every = max(1, checkpoint_sync_every)
-    t0 = time.time()
 
-    if not checkpoint_dir:
-        embs_sorted: List[np.ndarray] = []
-        for batch_idx, i in enumerate(range(0, num_seqs, batch_size), start=1):
-            batch = seqs_sorted[i:i + batch_size]
-            b0 = time.time()
-            out = encode(batch, tmvec_model, t5, tok, device)
-            out = np.asarray(out, dtype=np.float32)
-            embs_sorted.append(out)
-            if batch_idx == 1 or batch_idx == num_batches or (log_every and batch_idx % log_every == 0):
-                elapsed = time.time() - t0
-                avg_per_batch = elapsed / batch_idx
-                eta = avg_per_batch * (num_batches - batch_idx)
-                batch_lens = [len(x) for x in batch]
-                log(
-                    f"Batch {batch_idx}/{num_batches} | sorted_seqs {min(i + len(batch), num_seqs)}/{num_seqs} | "
-                    f"len[min/med/max]={min(batch_lens)}/{int(np.median(batch_lens))}/{max(batch_lens)} | "
-                    f"last_batch={time.time() - b0:.2f}s | avg_batch={avg_per_batch:.2f}s | "
-                    f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)} | {cuda_mem_str()}"
-                )
-        embs_sorted_arr = np.concatenate(embs_sorted, axis=0)
-        embs = np.empty_like(embs_sorted_arr)
-        embs[inverse] = embs_sorted_arr
-        return embs
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-12, None)
+    return x / norms
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    emb_path, meta_path = _emb_ckpt_paths(checkpoint_dir)
 
-    start_batch = 0
-    if resume_embeddings and os.path.exists(emb_path) and os.path.exists(meta_path):
-        meta = _read_json(meta_path)
-        expected = {
-            "num_seqs": num_seqs,
-            "batch_size": batch_size,
-            "emb_dim": emb_dim,
-            "sequence_fingerprint": seq_fingerprint,
-            "disable_length_bucketing": disable_length_bucketing,
+def maybe_truncate(seq: str, max_len: Optional[int]) -> str:
+    if max_len is None or max_len <= 0:
+        return seq
+    return seq[:max_len]
+
+
+def parse_accession(seq_id: str) -> str:
+    token = seq_id.split()[0]
+    if '|' in token:
+        parts = token.split('|')
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    if token.startswith('AF-') and '-F1' in token:
+        return token.split('-')[1]
+    return token
+
+
+def predicted_tm_from_cosine(cosine: np.ndarray) -> np.ndarray:
+    """TM-Vec-style calibration: treat cosine similarity of normalized embeddings as predicted TM-score."""
+    cosine = np.asarray(cosine, dtype=np.float32)
+    return np.clip(cosine, 0.0, 1.0)
+
+
+def build_faiss_index(embs: np.ndarray):
+    import faiss  # type: ignore
+
+    index = faiss.IndexFlatIP(int(embs.shape[1]))
+    index.add(np.asarray(embs, dtype=np.float32))
+    return index
+
+
+def batched_topk_inner_product(embs: np.ndarray, query_idx: int, top_k: int, batch_size: int = 16384) -> Tuple[np.ndarray, np.ndarray]:
+    """Fallback top-k search without materializing a full NxN similarity matrix."""
+    query = embs[query_idx:query_idx + 1]
+    best_scores = np.full((top_k,), -np.inf, dtype=np.float32)
+    best_indices = np.full((top_k,), -1, dtype=np.int64)
+    n = embs.shape[0]
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        scores = (embs[start:stop] @ query.T).reshape(-1)
+        candidate_indices = np.arange(start, stop, dtype=np.int64)
+        merged_scores = np.concatenate([best_scores, scores], axis=0)
+        merged_indices = np.concatenate([best_indices, candidate_indices], axis=0)
+        order = np.argpartition(-merged_scores, kth=min(top_k - 1, len(merged_scores) - 1))[:top_k]
+        best_scores = merged_scores[order]
+        best_indices = merged_indices[order]
+        final_order = np.argsort(-best_scores)
+        best_scores = best_scores[final_order]
+        best_indices = best_indices[final_order]
+    return best_scores, best_indices
+
+
+_STANDARD_AA = {
+    'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C', 'GLN': 'Q', 'GLU': 'E',
+    'GLY': 'G', 'HIS': 'H', 'ILE': 'I', 'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F',
+    'PRO': 'P', 'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V',
+    'SEC': 'U', 'PYL': 'O',
+}
+
+
+def _build_structure_candidates(seq_id: str, accession: str, filename_template: Optional[str], extension_order: Sequence[str]) -> List[str]:
+    candidates: List[str] = []
+    if filename_template:
+        candidates.append(filename_template.format(id=seq_id, accession=accession))
+    stem_candidates = OrderedDict.fromkeys([
+        seq_id,
+        accession,
+        f'AF-{accession}-F1-model_v6',
+        f'AF-{accession}-F1-model_v4',
+        f'AF-{accession}-F1-model_v3',
+    ])
+    for stem in stem_candidates:
+        for ext in extension_order:
+            candidates.append(f'{stem}{ext}')
+            candidates.append(f'{stem}{ext}.gz')
+    return candidates
+
+
+def resolve_structure_path(structure_dir: str, seq_id: str, accession: str, filename_template: Optional[str], extension_order: Sequence[str]) -> Optional[str]:
+    structure_dir_path = Path(structure_dir)
+    for candidate in _build_structure_candidates(seq_id, accession, filename_template, extension_order):
+        candidate_path = structure_dir_path / candidate
+        if candidate_path.exists():
+            return str(candidate_path)
+    return None
+
+
+class StructureTMScorer:
+    def __init__(self, structure_dir: str, filename_template: Optional[str], tm_score_impl: str, tm_score_norm: str):
+        self.structure_dir = structure_dir
+        self.filename_template = filename_template
+        self.tm_score_impl = tm_score_impl
+        self.tm_score_norm = tm_score_norm
+        self._cache: Dict[str, Optional[Tuple[np.ndarray, str, str]]] = {}
+        self._tmtools_ready = False
+        self._external_binary = None
+        self._archive = None
+        self._archive_members: Dict[str, str] = {}
+        self._temp_dir_obj = None
+        self._temp_dir = None
+        structure_path = Path(structure_dir)
+        if structure_path.is_file() and structure_path.suffix == '.tar':
+            self._archive = tarfile.open(structure_dir, mode='r')
+            self._archive_members = self._index_archive_members(self._archive)
+        if tm_score_impl == 'tmtools':
+            from Bio.PDB import MMCIFParser, PDBParser  # noqa: F401
+            from tmtools import tm_align  # noqa: F401
+            self._tmtools_ready = True
+        elif tm_score_impl == 'usalign':
+            if shutil.which('USalign') is not None:
+                self._external_binary = 'USalign'
+            elif shutil.which('TMalign') is not None:
+                self._external_binary = 'TMalign'
+            else:
+                raise RuntimeError('tm_score_impl=usalign requested, but neither USalign nor TMalign was found in PATH')
+        else:
+            raise ValueError(f'Unsupported tm_score_impl: {tm_score_impl}')
+
+    @staticmethod
+    def _index_archive_members(archive: tarfile.TarFile) -> Dict[str, str]:
+        member_map: Dict[str, str] = {}
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            basename = Path(member.name).name
+            member_map.setdefault(basename, member.name)
+        return member_map
+
+    def _resolve_archive_member(self, seq_id: str, accession: str) -> Optional[str]:
+        extension_order = ('.pdb', '.cif', '.mmcif')
+        for candidate in _build_structure_candidates(seq_id, accession, self.filename_template, extension_order):
+            if candidate in self._archive_members:
+                return self._archive_members[candidate]
+        return None
+
+    def _extract_archive_member_to_bytes(self, member_name: str) -> Tuple[bytes, str]:
+        extracted = self._archive.extractfile(member_name)
+        if extracted is None:
+            raise FileNotFoundError(f'Could not extract archive member: {member_name}')
+        raw = extracted.read()
+        suffix = ''.join(Path(member_name).suffixes)
+        if suffix.endswith('.gz'):
+            raw = gzip.decompress(raw)
+            suffix = suffix[:-3]
+        return raw, suffix
+
+    def _materialize_archive_member(self, seq_id: str, accession: str) -> Optional[str]:
+        member_name = self._resolve_archive_member(seq_id, accession)
+        if member_name is None:
+            return None
+        raw, suffix = self._extract_archive_member_to_bytes(member_name)
+        if self._temp_dir is None:
+            self._temp_dir_obj = tempfile.TemporaryDirectory(prefix='tm_score_structures_')
+            self._temp_dir = self._temp_dir_obj.name
+        safe_name = Path(member_name).name
+        if safe_name.endswith('.gz'):
+            safe_name = safe_name[:-3]
+        out_path = Path(self._temp_dir) / safe_name
+        if not out_path.exists():
+            out_path.write_bytes(raw)
+        return str(out_path)
+
+    def _parse_structure_from_path_or_bytes(self, structure_id: str, path: Optional[str] = None, raw: Optional[bytes] = None, raw_suffix: Optional[str] = None):
+        from Bio.PDB import MMCIFParser, PDBParser
+
+        if path is not None:
+            parse_suffix = ''.join(Path(path).suffixes).lower()
+        else:
+            parse_suffix = (raw_suffix or '').lower()
+        if parse_suffix.endswith(('.cif', '.mmcif')):
+            parser = MMCIFParser(QUIET=True)
+        else:
+            parser = PDBParser(QUIET=True)
+        if path is not None:
+            return parser.get_structure(structure_id, path)
+        handle = io.StringIO(raw.decode('utf-8'))
+        return parser.get_structure(structure_id, handle)
+
+    @staticmethod
+    def _score_from_tmtools_result(result, norm: str) -> float:
+        values = {
+            'chain1': float(result.tm_norm_chain1),
+            'chain2': float(result.tm_norm_chain2),
+            'avg': float((result.tm_norm_chain1 + result.tm_norm_chain2) / 2.0),
+            'max': float(max(result.tm_norm_chain1, result.tm_norm_chain2)),
+            'min': float(min(result.tm_norm_chain1, result.tm_norm_chain2)),
         }
-        for k, v in expected.items():
-            if meta.get(k) != v:
-                raise ValueError(
-                    f"Embedding checkpoint mismatch for {k}: current run expects {v!r} but got {meta.get(k)!r}"
-                )
-        start_batch = int(meta.get("completed_batches", 0))
-        log(f"Resuming embeddings from batch {start_batch + 1}/{num_batches} at {checkpoint_dir}")
-        embs_mm = np.memmap(emb_path, dtype=np.float32, mode="r+", shape=(num_seqs, emb_dim))
-    else:
-        log(f"Creating new embedding checkpoint store at {checkpoint_dir}")
-        embs_mm = np.memmap(emb_path, dtype=np.float32, mode="w+", shape=(num_seqs, emb_dim))
-        _write_json(
-            meta_path,
-            {
-                "num_seqs": num_seqs,
-                "batch_size": batch_size,
-                "emb_dim": emb_dim,
-                "completed_batches": 0,
-                "completed_seqs": 0,
-                "dtype": "float32",
-                "created_at": _now(),
-                "sync_every": sync_every,
-                "sequence_fingerprint": seq_fingerprint,
-                "disable_length_bucketing": disable_length_bucketing,
-            },
+        if norm not in values:
+            raise ValueError(f'Unsupported tm_score_norm: {norm}')
+        return values[norm]
+
+    @staticmethod
+    def _parse_usalign_score(stdout: str, norm: str) -> float:
+        import re
+
+        matches = re.findall(r'TM-score=\s*([0-9]*\.?[0-9]+)', stdout)
+        if not matches:
+            raise RuntimeError('Could not parse TM-score from USalign/TMalign output')
+        scores = [float(m) for m in matches[:2]]
+        if len(scores) == 1:
+            scores.append(scores[0])
+        if norm == 'chain1':
+            return scores[0]
+        if norm == 'chain2':
+            return scores[1]
+        if norm == 'avg':
+            return sum(scores[:2]) / 2.0
+        if norm == 'max':
+            return max(scores[:2])
+        if norm == 'min':
+            return min(scores[:2])
+        raise ValueError(f'Unsupported tm_score_norm: {norm}')
+
+    def _load_structure(self, seq_id: str, accession: str) -> Optional[Tuple[np.ndarray, str, str]]:
+        cache_key = accession or seq_id
+        if cache_key in self._cache:
+            cached = self._cache[cache_key]
+            if cached is None:
+                return None
+            coords, seq, path = cached
+            return coords, seq, path
+
+        extension_order = ('.pdb', '.cif', '.mmcif')
+        path: Optional[str] = None
+        raw: Optional[bytes] = None
+        raw_suffix: Optional[str] = None
+        if self._archive is not None:
+            member_name = self._resolve_archive_member(seq_id, accession)
+            if member_name is None:
+                self._cache[cache_key] = None
+                return None
+            if self.tm_score_impl == 'usalign':
+                path = self._materialize_archive_member(seq_id, accession)
+                if path is None:
+                    self._cache[cache_key] = None
+                    return None
+            else:
+                raw, raw_suffix = self._extract_archive_member_to_bytes(member_name)
+                path = f'{self.structure_dir}::{member_name}'
+        else:
+            resolved_path = resolve_structure_path(self.structure_dir, seq_id, accession, self.filename_template, extension_order)
+            if resolved_path is None:
+                self._cache[cache_key] = None
+                return None
+            if resolved_path.endswith('.gz'):
+                raw = gzip.decompress(Path(resolved_path).read_bytes())
+                raw_suffix = ''.join(Path(resolved_path).suffixes[:-1])
+                path = resolved_path
+            else:
+                path = resolved_path
+
+        structure = self._parse_structure_from_path_or_bytes(accession or seq_id, None if raw is not None and self.tm_score_impl == 'tmtools' else path, raw=raw, raw_suffix=raw_suffix)
+
+        coords = []
+        seq = []
+        for model in structure:
+            for chain in model:
+                for residue in chain:
+                    resname = residue.get_resname().upper()
+                    if resname not in _STANDARD_AA or 'CA' not in residue:
+                        continue
+                    coords.append(residue['CA'].coord)
+                    seq.append(_STANDARD_AA[resname])
+                if coords:
+                    break
+            if coords:
+                break
+
+        if not coords:
+            self._cache[cache_key] = None
+            return None
+
+        out = (np.asarray(coords, dtype=np.float64), ''.join(seq), path or '')
+        self._cache[cache_key] = out
+        return out
+
+    def score_pair(self, anchor_id: str, anchor_accession: str, other_id: str, other_accession: str) -> Optional[float]:
+        anchor = self._load_structure(anchor_id, anchor_accession)
+        other = self._load_structure(other_id, other_accession)
+        if anchor is None or other is None:
+            return None
+        anchor_coords, anchor_seq, anchor_path = anchor
+        other_coords, other_seq, other_path = other
+
+        if self.tm_score_impl == 'tmtools':
+            from tmtools import tm_align
+
+            result = tm_align(anchor_coords, other_coords, anchor_seq, other_seq)
+            return self._score_from_tmtools_result(result, self.tm_score_norm)
+
+        proc = subprocess.run(
+            [self._external_binary, anchor_path, other_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
         )
-
-    batches_since_sync = 0
-    for batch_idx, i in enumerate(range(0, num_seqs, batch_size), start=1):
-        batch_end = min(i + batch_size, num_seqs)
-        if batch_idx <= start_batch:
-            if batch_idx == start_batch:
-                log(f"Skipped already-checkpointed batches through {batch_end}/{num_seqs} sorted sequences")
-            continue
-
-        batch = seqs_sorted[i:batch_end]
-        b0 = time.time()
-        out = encode(batch, tmvec_model, t5, tok, device)
-        out = np.asarray(out, dtype=np.float32)
-        if out.ndim != 2 or out.shape[0] != len(batch) or out.shape[1] != emb_dim:
-            raise ValueError(
-                f"Unexpected embedding shape from encode(): got {out.shape}, expected ({len(batch)}, {emb_dim})"
-            )
-        embs_mm[i:batch_end] = out
-        batches_since_sync += 1
-
-        should_sync = (batches_since_sync >= sync_every) or (batch_idx == num_batches)
-        if should_sync:
-            embs_mm.flush()
-            _write_json(
-                meta_path,
-                {
-                    "num_seqs": num_seqs,
-                    "batch_size": batch_size,
-                    "emb_dim": emb_dim,
-                    "completed_batches": batch_idx,
-                    "completed_seqs": batch_end,
-                    "dtype": "float32",
-                    "updated_at": _now(),
-                    "sync_every": sync_every,
-                    "sequence_fingerprint": seq_fingerprint,
-                    "disable_length_bucketing": disable_length_bucketing,
-                },
-            )
-            batches_since_sync = 0
-
-        if batch_idx == 1 or batch_idx == num_batches or (log_every and batch_idx % log_every == 0):
-            elapsed = time.time() - t0
-            completed_since_resume = max(1, batch_idx - start_batch)
-            avg_per_batch = elapsed / completed_since_resume
-            eta = avg_per_batch * (num_batches - batch_idx)
-            batch_lens = [len(x) for x in batch]
-            log(
-                f"Batch {batch_idx}/{num_batches} | sorted_seqs {batch_end}/{num_seqs} | "
-                f"len[min/med/max]={min(batch_lens)}/{int(np.median(batch_lens))}/{max(batch_lens)} | "
-                f"last_batch={time.time() - b0:.2f}s | avg_batch={avg_per_batch:.2f}s | "
-                f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)} | "
-                f"sync_every={sync_every} | {cuda_mem_str()}"
-            )
-
-    embs_sorted = np.array(embs_mm, dtype=np.float32, copy=True)
-    del embs_mm
-    embs = np.empty_like(embs_sorted)
-    embs[inverse] = embs_sorted
-    return embs
+        return self._parse_usalign_score(proc.stdout, self.tm_score_norm)
 
 
-def build_index(
-    embs: np.ndarray,
-    use_faiss: bool,
-    approx_index: str,
-    ivf_nlist: int,
-    hnsw_m: int,
-    hnsw_ef_search: int,
-    hnsw_ef_construction: int,
-):
-    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
-    embs_n = embs / norms
+# shutil imported lazily to keep module import cheap when exact TM is not used.
+import shutil
 
-    if use_faiss:
-        if not _HAVE_FAISS:
-            raise RuntimeError("use_faiss=true but faiss is not installed")
-        d = embs_n.shape[1]
-        xb = embs_n.astype(np.float32)
-
-        if approx_index == "flat":
-            log("Building exact FAISS IndexFlatIP")
-            index = faiss.IndexFlatIP(d)
-            index.add(xb)
-            return ("faiss_flat", index, embs_n)
-
-        if approx_index == "ivfflat":
-            nlist = max(1, min(ivf_nlist, xb.shape[0]))
-            quantizer = faiss.IndexFlatIP(d)
-            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-            log("Training FAISS IndexIVFFlat")
-            index.train(xb)
-            index.add(xb)
-            index.nprobe = min(max(1, int(round(math.sqrt(nlist)))), nlist)
-            log("Built approximate FAISS IndexIVFFlat")
-            return ("faiss_ivfflat", index, embs_n)
-
-        if approx_index == "hnsw":
-            log("Building approximate FAISS IndexHNSWFlat")
-            index = faiss.IndexHNSWFlat(d, hnsw_m, faiss.METRIC_INNER_PRODUCT)
-            index.hnsw.efConstruction = hnsw_ef_construction
-            index.add(xb)
-            index.hnsw.efSearch = hnsw_ef_search
-            log("Built approximate FAISS IndexHNSWFlat")
-            return ("faiss_hnsw", index, embs_n)
-
-        raise ValueError(f"Unsupported approx_index: {approx_index}")
-
-    log("Using brute-force numpy search")
-    return ("bruteforce", None, embs_n)
+logger = logging.getLogger(__name__)
 
 
-def knn_search(kind, index, embs_n: np.ndarray, query_n: np.ndarray, top_k: int, query_chunk_size: int, log_every_chunks: int):
-    num_queries = query_n.shape[0]
-    if kind.startswith("faiss"):
-        score_chunks = []
-        idx_chunks = []
-        num_chunks = math.ceil(num_queries / query_chunk_size)
-        t0 = time.time()
-        for chunk_idx, start in enumerate(range(0, num_queries, query_chunk_size), start=1):
-            end = min(start + query_chunk_size, num_queries)
-            q = query_n[start:end].astype(np.float32)
-            c0 = time.time()
-            scores, idxs = index.search(q, top_k)
-            score_chunks.append(scores)
-            idx_chunks.append(idxs)
-            if chunk_idx == 1 or chunk_idx == num_chunks or (log_every_chunks and chunk_idx % log_every_chunks == 0):
-                elapsed = time.time() - t0
-                avg = elapsed / chunk_idx
-                eta = avg * (num_chunks - chunk_idx)
-                log(
-                    f"Chunk {chunk_idx}/{num_chunks} | "
-                    f"queries {end}/{num_queries} | last_chunk={time.time() - c0:.2f}s | "
-                    f"avg_chunk={avg:.2f}s | elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)}"
-                )
-        return np.concatenate(score_chunks, axis=0), np.concatenate(idx_chunks, axis=0)
-
-    log("Starting brute-force matrix multiplication")
-    scores = query_n @ embs_n.T
-    idxs = np.argsort(-scores, axis=1)[:, :top_k]
-    top_scores = np.take_along_axis(scores, idxs, axis=1)
-    return top_scores, idxs
+def summarize(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {}
+    arr = np.asarray(values, dtype=np.float32)
+    return {
+        'min': float(arr.min()),
+        'p25': float(np.percentile(arr, 25)),
+        'median': float(np.median(arr)),
+        'p75': float(np.percentile(arr, 75)),
+        'max': float(arr.max()),
+        'mean': float(arr.mean()),
+    }
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--uniprot_dat", required=True, help="Path to uniprot_sprot.dat or .dat.gz")
-    ap.add_argument("--out_tsv", required=True, help="Output TSV path")
-    ap.add_argument("--out_emb_npy", default=None, help="Output .npy path for precomputed TM-Vec embeddings")
-    ap.add_argument("--emb_dtype", default="float16", choices=["float16", "float32"], help="Dtype for saved embeddings")
-    ap.add_argument("--tmvec_ckpt", required=True, help="TM-Vec checkpoint (.ckpt)")
-    ap.add_argument("--tmvec_config", required=True, help="TM-Vec params JSON")
-    ap.add_argument("--prot_t5_name", default="Rostlab/prot_t5_xl_uniref50")
-    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
-    ap.add_argument("--max_proteins", type=int, default=None, help="Optional limit on accepted proteins")
-    ap.add_argument("--min_len", type=int, default=50)
-    ap.add_argument("--max_len", type=int, default=2000)
-    ap.add_argument("--encode_batch_size", type=int, default=8)
-    ap.add_argument("--top_k", type=int, default=10)
-    ap.add_argument("--pairs_per_anchor", type=int, default=1, help="How many positive pairs to emit per anchor (<= top_k)")
-    ap.add_argument("--use_faiss", action="store_true")
-    ap.add_argument("--approx_index", default="ivfflat", choices=["flat", "ivfflat", "hnsw"], help="FAISS index type")
-    ap.add_argument("--ivf_nlist", type=int, default=4096, help="Number of IVF cells for ivfflat")
-    ap.add_argument("--hnsw_m", type=int, default=32, help="Graph degree for HNSW")
-    ap.add_argument("--hnsw_ef_search", type=int, default=128, help="efSearch for HNSW")
-    ap.add_argument("--hnsw_ef_construction", type=int, default=200, help="efConstruction for HNSW")
-    ap.add_argument("--model_dtype", default="float32", choices=["auto", "float16", "float32"], help="Precision for loading ProtT5 (auto: float16 on CUDA, float32 on CPU)")
-    ap.add_argument("--tmvec_half", action="store_true", help="Whether to cast TM-Vec model to float16 on CUDA (currently disabled)")
-    ap.add_argument("--embed_checkpoint_dir", default=None, help="Directory for embedding checkpoint")
-    ap.add_argument("--resume_embeddings", action="store_true", help="Resume from existing embedding checkpoint")
-    ap.add_argument("--embed_checkpoint_sync_every", type=int, default=10, help="Flush embedding checkpoint to disk every N batches")
-    ap.add_argument("--disable_length_bucketing", action="store_true", help="Disable sequence length bucketing during embedding")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--sequence_log_every", type=int, default=50000, help="Log every N accepted sequences while reading UniProt")
-    ap.add_argument("--encode_log_every", type=int, default=25, help="Log every N encode batches")
-    ap.add_argument("--knn_query_chunk_size", type=int, default=4096, help="Number of queries per FAISS search call")
-    ap.add_argument("--knn_log_every", type=int, default=10, help="Log every N FAISS query chunks")
-    ap.add_argument("--write_log_every", type=int, default=50000, help="Log every N anchors while writing TSV")
+    ap = argparse.ArgumentParser(description='Mine explicit anchor/positive/negative triplets from precomputed TM-Vec embeddings.')
+    ap.add_argument('--swiss_fasta', required=True)
+    ap.add_argument('--swiss_tmvec_emb_npy', required=True)
+    ap.add_argument('--swiss_tmvec_metadata_npy', default=None)
+    ap.add_argument('--out_tsv', required=True)
+    ap.add_argument('--out_metadata_json', default=None)
+    ap.add_argument('--top_k_pos', type=int, default=5)
+    ap.add_argument('--triplets_per_anchor', type=int, default=1)
+    ap.add_argument('--positive_search_k', type=int, default=64, help='Nearest-neighbor candidate pool to retrieve before positive reranking/filtering.')
+    ap.add_argument('--positive_tmscore_min', type=float, default=0.0, help='Optional minimum predicted/actual TM-score for positives.')
+    ap.add_argument('--neg_random_pool', type=int, default=256)
+    ap.add_argument('--negative_tmscore_max', type=float, default=0.2, help='Pairs at or below this TM-score are treated as structurally dissimilar.')
+    ap.add_argument('--neg_similarity_max', type=float, default=None, help='Deprecated alias for --negative_tmscore_max.')
+    ap.add_argument('--negative_pick_strategy', choices=['random', 'hardest', 'easiest'], default='hardest')
+    ap.add_argument('--max_proteins', type=int, default=None)
+    ap.add_argument('--max_protein_seq_length', type=int, default=None)
+    ap.add_argument('--seed', type=int, default=2021)
+    ap.add_argument('--use_faiss', action='store_true', help='Use a FAISS inner-product index for positive candidate mining when available.')
+    ap.add_argument('--exact_tm_score_structures_dir', default=None, help='Optional directory of PDB/mmCIF structures, .pdb.gz/.cif.gz files, or an AlphaFold archive')
+    ap.add_argument('--structure_filename_template', default=None, help='Optional filename template, e.g. AF-{accession}-F1-model_v4.pdb or {id}.pdb.')
+    ap.add_argument('--tm_score_impl', choices=['tmtools', 'usalign'], default='tmtools', help='Exact TM-score backend used when --exact_tm_score_structures_dir is provided.')
+    ap.add_argument('--tm_score_norm', choices=['chain1', 'chain2', 'avg', 'max', 'min'], default='chain1', help='How to choose the normalized TM-score when the backend reports both directions.')
+    ap.add_argument('--log_every_anchors', type=int, default=1000, help='Print progress every N processed anchors. 0 disables periodic progress logging.')
     args = ap.parse_args()
 
-    if args.resume_embeddings and not args.embed_checkpoint_dir:
-        raise ValueError("--resume_embeddings requires --embed_checkpoint_dir")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
-    random.seed(args.seed)
+    if args.neg_similarity_max is not None:
+        args.negative_tmscore_max = args.neg_similarity_max
+
+    rng = random.Random(args.seed)
     np.random.seed(args.seed)
 
-    t_start = time.time()
-    log(f"Starting run with args: {' '.join(sys.argv[1:])}")
-    log(f"Torch version={torch.__version__} | CUDA available={torch.cuda.is_available()} | {cuda_mem_str()}")
+    ids, seqs = read_fasta(args.swiss_fasta)
+    embs = np.load(args.swiss_tmvec_emb_npy)
+    if args.max_proteins is not None:
+        ids = ids[:args.max_proteins]
+        seqs = seqs[:args.max_proteins]
+        embs = embs[:args.max_proteins]
+    if len(seqs) != int(embs.shape[0]):
+        raise ValueError(f'FASTA/embedding mismatch: {len(seqs)} vs. {embs.shape[0]}')
 
-    seqs: List[str] = []
-    read_t0 = time.time()
-    for s in iter_uniprot_sequences(args.uniprot_dat):
-        if len(s) < args.min_len:
-            continue
-        if len(s) > args.max_len:
-            s = s[: args.max_len]
-        seqs.append(s)
-        if len(seqs) == 1 or (args.sequence_log_every and len(seqs) % args.sequence_log_every == 0):
-            log(f"Loaded {len(seqs)} sequences")
-        if args.max_proteins is not None and args.max_proteins > 0 and len(seqs) >= args.max_proteins:
-            log("Reached max_proteins")
-            break
+    normalized_embs = normalize_rows(embs)
+    accessions = [parse_accession(seq_id) for seq_id in ids]
+    n = len(seqs)
+    all_indices = np.arange(n)
 
-    if len(seqs) < 2:
-        raise ValueError("Need at least 2 sequences")
-    log(f"Finished loading {len(seqs)} sequences in {format_seconds(time.time() - read_t0)}")
+    faiss_index = None
+    faiss_enabled = False
+    if args.use_faiss:
+        try:
+            faiss_index = build_faiss_index(normalized_embs)
+            faiss_enabled = True
+        except Exception as exc:  # pragma: no cover - best-effort optional dependency
+            print(f'Could not initialize FAISS ({exc}); falling back to streamed NumPy search.')
 
-    tmvec_model, t5, tok = load_tmvec_models(
-        args.tmvec_ckpt,
-        args.tmvec_config,
-        args.prot_t5_name,
-        args.device,
-        args.model_dtype,
-        args.tmvec_half,
+    structure_scorer = None
+    if args.exact_tm_score_structures_dir:
+        structure_scorer = StructureTMScorer(
+            structure_dir=args.exact_tm_score_structures_dir,
+            filename_template=args.structure_filename_template,
+            tm_score_impl=args.tm_score_impl,
+            tm_score_norm=args.tm_score_norm,
+        )
+
+    out_path = args.out_tsv
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+
+    logger.info(
+        'Triplet mining config | num_sequences=%d | embedding_dim=%d | out_tsv=%s | top_k_pos=%d | triplets_per_anchor=%d | positive_search_k=%d | positive_tmscore_min=%.3f | neg_random_pool=%d | negative_tmscore_max=%.3f | negative_pick_strategy=%s | use_faiss=%s | exact_tm_score=%s | tm_score_impl=%s | tm_score_norm=%s | max_protein_seq_length=%s | max_proteins=%s',
+        len(seqs),
+        int(normalized_embs.shape[1]),
+        out_path,
+        args.top_k_pos,
+        args.triplets_per_anchor,
+        args.positive_search_k,
+        args.positive_tmscore_min,
+        args.neg_random_pool,
+        args.negative_tmscore_max,
+        args.negative_pick_strategy,
+        faiss_enabled,
+        bool(args.exact_tm_score_structures_dir),
+        args.tm_score_impl if args.exact_tm_score_structures_dir else None,
+        args.tm_score_norm if args.exact_tm_score_structures_dir else None,
+        args.max_protein_seq_length,
+        args.max_proteins,
     )
 
-    enc_t0 = time.time()
-    embs = encode_in_batches_checkpointed(
-        seqs,
-        tmvec_model,
-        t5,
-        tok,
-        device=args.device,
-        batch_size=args.encode_batch_size,
-        log_every=args.encode_log_every,
-        checkpoint_dir=args.embed_checkpoint_dir,
-        resume_embeddings=args.resume_embeddings,
-        emb_dim=512,
-        checkpoint_sync_every=args.embed_checkpoint_sync_every,
-        disable_length_bucketing=args.disable_length_bucketing,
-    )
-    log(f"Embeddings shape: {embs.shape} | encode_time={format_seconds(time.time() - enc_t0)}")
+    rows = 0
+    skipped = 0
+    missing_exact_positive = 0
+    missing_exact_negative = 0
+    positive_scores_logged: List[float] = []
+    negative_scores_logged: List[float] = []
+    positive_score_mode = 'predicted_tmvec_tmscore'
+    negative_score_mode = 'predicted_tmvec_tmscore'
+    anchors_processed = 0
+    anchors_with_triplets = 0
+    start_time = time.time()
 
-    if args.out_emb_npy is not None:
-        dtype = np.float16 if args.emb_dtype == "float16" else np.float32
-        est_pair_gb = (len(seqs) * max(1, args.pairs_per_anchor) * 2 * embs.shape[1] * np.dtype(dtype).itemsize) / (1024 ** 3)
-        log(f"Estimated pair embedding file size: ~{est_pair_gb:.2f} GB")
+    def _log_progress(force: bool = False):
+        if not force and (args.log_every_anchors is None or args.log_every_anchors <= 0):
+            return
+        if not force and anchors_processed == 0:
+            return
+        elapsed = max(time.time() - start_time, 1e-9)
+        anchors_per_sec = anchors_processed / elapsed
+        rows_per_sec = rows / elapsed if rows > 0 else 0.0
+        pct = (anchors_processed / n * 100.0) if n > 0 else 100.0
+        remaining = max(n - anchors_processed, 0)
+        eta_seconds = remaining / anchors_per_sec if anchors_per_sec > 0 else float('inf')
+        pos_summary = summarize(positive_scores_logged[-1000:])
+        neg_summary = summarize(negative_scores_logged[-1000:])
+        logger.info(
+            'Triplet mining progress | anchors=%d/%d (%.2f%%) | rows_written=%d | anchors_with_triplets=%d | skipped=%d | missing_exact_pos=%d | missing_exact_neg=%d | elapsed=%.1fs | anchors_per_sec=%.2f | rows_per_sec=%.2f | eta_seconds=%s | pos_mean=%s | neg_mean=%s',
+            anchors_processed, n, pct, rows, anchors_with_triplets, skipped, missing_exact_positive, missing_exact_negative, elapsed, anchors_per_sec, rows_per_sec,
+            'inf' if eta_seconds == float('inf') else f'{eta_seconds:.1f}',
+            None if not pos_summary else f"{pos_summary['mean']:.4f}",
+            None if not neg_summary else f"{neg_summary['mean']:.4f}",
+        )
 
-    index_t0 = time.time()
-    kind, index, embs_n = build_index(
-        embs,
-        use_faiss=args.use_faiss,
-        approx_index=args.approx_index,
-        ivf_nlist=args.ivf_nlist,
-        hnsw_m=args.hnsw_m,
-        hnsw_ef_search=args.hnsw_ef_search,
-        hnsw_ef_construction=args.hnsw_ef_construction,
-    )
-    log(f"Index ready in {format_seconds(time.time() - index_t0)}")
+    with open(out_path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerow([
+            'anchor_id', 'positive_id', 'negative_id',
+            'anchor_seq', 'positive_seq', 'negative_seq',
+            'positive_score', 'negative_score'
+        ])
 
-    query_n = embs_n
-    k_search = min(args.top_k + 1, len(seqs))
-    knn_t0 = time.time()
-    scores, idxs = knn_search(kind, index, embs_n, query_n, k_search, args.knn_query_chunk_size, args.knn_log_every)
-    log(f"KNN search complete in {format_seconds(time.time() - knn_t0)} | scores_shape={scores.shape} idxs_shape={idxs.shape}")
+        for i in range(n):
+            anchors_processed += 1
+            if faiss_enabled:
+                top_scores, top_indices = faiss_index.search(normalized_embs[i:i + 1], k=min(args.positive_search_k + 1, n))
+                nn_scores = top_scores[0]
+                nn_indices = top_indices[0]
+            else:
+                nn_scores, nn_indices = batched_topk_inner_product(normalized_embs, i, top_k=min(args.positive_search_k + 1, n))
 
-    os.makedirs(os.path.dirname(args.out_tsv) or ".", exist_ok=True)
-    out_lines = 0
-    pair_indices: List[Tuple[int, int]] = []
-    write_t0 = time.time()
-    with open(args.out_tsv, "w", encoding="utf-8") as out:
-        for i in range(len(seqs)):
-            neighbors = idxs[i].tolist()
-            neighbors = [j for j in neighbors if j != i and j >= 0]
-            if not neighbors:
+            positive_candidates = []
+            for cand_score, cand_idx in zip(nn_scores.tolist(), nn_indices.tolist()):
+                if cand_idx < 0 or cand_idx == i:
+                    continue
+                predicted_score = float(predicted_tm_from_cosine(np.array([cand_score]))[0])
+                if predicted_score < args.positive_tmscore_min:
+                    continue
+                score = predicted_score
+                score_mode = 'predicted_tmvec_tmscore'
+                if structure_scorer is not None:
+                    exact_score = structure_scorer.score_pair(ids[i], accessions[i], ids[cand_idx], accessions[cand_idx])
+                    if exact_score is not None:
+                        score = float(exact_score)
+                        score_mode = f'exact_{args.tm_score_impl}_tm_score'
+                    else:
+                        missing_exact_positive += 1
+                positive_candidates.append((cand_idx, score, score_mode))
+
+            positive_candidates.sort(key=lambda x: x[1], reverse=True)
+            positive_candidates = [x for x in positive_candidates if x[1] >= args.positive_tmscore_min]
+            chosen_positives = positive_candidates[:max(args.top_k_pos, args.triplets_per_anchor)]
+            if not chosen_positives:
+                skipped += 1
+                if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
+                    _log_progress()
                 continue
 
-            for j in neighbors[: max(1, min(args.pairs_per_anchor, len(neighbors)))]:
-                out.write(f"{seqs[i]}\t{seqs[j]}\n")
-                pair_indices.append((i, j))
-                out_lines += 1
+            forbidden = {i, *[idx for idx, _, _ in chosen_positives]}
+            neg_sample_size = min(max(args.neg_random_pool, args.triplets_per_anchor), max(0, n - len(forbidden)))
+            if neg_sample_size <= 0:
+                skipped += 1
+                if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
+                    _log_progress()
+                continue
+            negative_pool = rng.sample([idx for idx in all_indices.tolist() if idx not in forbidden], k=neg_sample_size)
 
-            if i == 0 or i + 1 == len(seqs) or (args.write_log_every and (i + 1) % args.write_log_every == 0):
-                elapsed = time.time() - write_t0
-                avg = elapsed / (i + 1)
-                eta = avg * (len(seqs) - (i + 1))
-                log(
-                    f"Anchors {i + 1}/{len(seqs)} | pairs={out_lines} | "
-                    f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)}"
-                )
-    log(f"Wrote {out_lines} pairs")
+            negative_candidates = []
+            neg_scores = predicted_tm_from_cosine(normalized_embs[negative_pool] @ normalized_embs[i])
+            for cand_idx, predicted_score in zip(negative_pool, neg_scores.tolist()):
+                score = float(predicted_score)
+                score_mode = 'predicted_tmvec_tmscore'
+                if structure_scorer is not None:
+                    exact_score = structure_scorer.score_pair(ids[i], accessions[i], ids[cand_idx], accessions[cand_idx])
+                    if exact_score is not None:
+                        score = float(exact_score)
+                        score_mode = f'exact_{args.tm_score_impl}_tm_score'
+                    else:
+                        missing_exact_negative += 1
+                if score <= args.negative_tmscore_max:
+                    negative_candidates.append((cand_idx, score, score_mode))
 
-    if args.out_emb_npy is not None:
-        save_t0 = time.time()
-        dtype = np.float16 if args.emb_dtype == "float16" else np.float32
-        pair_embs = np.empty((len(pair_indices) * 2, embs.shape[1]), dtype=dtype)
-        for k, (a_idx, p_idx) in enumerate(pair_indices):
-            pair_embs[2 * k] = embs[a_idx].astype(dtype, copy=False)
-            pair_embs[2 * k + 1] = embs[p_idx].astype(dtype, copy=False)
-            if k == 0 or k + 1 == len(pair_indices) or ((k + 1) % max(1, args.write_log_every) == 0):
-                elapsed = time.time() - save_t0
-                avg = elapsed / (k + 1)
-                eta = avg * (len(pair_indices) - (k + 1))
-                log(
-                    f"Pairs {k + 1}/{len(pair_indices)} | "
-                    f"elapsed={format_seconds(elapsed)} | eta={format_seconds(eta)}"
-                )
-        os.makedirs(os.path.dirname(args.out_emb_npy) or ".", exist_ok=True)
-        np.save(args.out_emb_npy, pair_embs)
-        log("Saved pair-order embeddings")
+            if not negative_candidates:
+                fallback_scores = []
+                for cand_idx, predicted_score in zip(negative_pool, neg_scores.tolist()):
+                    fallback_scores.append((cand_idx, float(predicted_score), 'predicted_tmvec_tmscore'))
+                fallback_scores.sort(key=lambda x: x[1])
+                negative_candidates = fallback_scores[:1]
 
-    log(f"Total runtime: {format_seconds(time.time() - t_start)}")
+            if not negative_candidates:
+                skipped += 1
+                if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
+                    _log_progress()
+                continue
+
+            if args.negative_pick_strategy == 'hardest':
+                negative_candidates.sort(key=lambda x: x[1], reverse=True)
+            elif args.negative_pick_strategy == 'easiest':
+                negative_candidates.sort(key=lambda x: x[1])
+            else:
+                rng.shuffle(negative_candidates)
+
+            wrote_any_triplet = False
+            for rank, (p_idx, p_score, p_mode) in enumerate(chosen_positives[:args.triplets_per_anchor]):
+                n_idx, n_score, n_mode = negative_candidates[min(rank, len(negative_candidates) - 1)]
+                writer.writerow([
+                    ids[i], ids[p_idx], ids[n_idx],
+                    maybe_truncate(seqs[i], args.max_protein_seq_length),
+                    maybe_truncate(seqs[p_idx], args.max_protein_seq_length),
+                    maybe_truncate(seqs[n_idx], args.max_protein_seq_length),
+                    f'{float(p_score):.6f}',
+                    f'{float(n_score):.6f}',
+                ])
+                rows += 1
+                wrote_any_triplet = True
+                positive_scores_logged.append(float(p_score))
+                negative_scores_logged.append(float(n_score))
+                positive_score_mode = p_mode
+                negative_score_mode = n_mode
+            if wrote_any_triplet:
+                anchors_with_triplets += 1
+            if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
+                _log_progress()
+
+    meta_path = args.out_metadata_json or (out_path[:-4] + '.metadata.json' if out_path.endswith('.tsv') else out_path + '.metadata.json')
+    meta = {
+        'swiss_fasta': os.path.abspath(args.swiss_fasta),
+        'swiss_tmvec_emb_npy': os.path.abspath(args.swiss_tmvec_emb_npy),
+        'swiss_tmvec_metadata_npy': os.path.abspath(args.swiss_tmvec_metadata_npy) if args.swiss_tmvec_metadata_npy else None,
+        'num_sequences': len(seqs),
+        'embedding_dim': int(normalized_embs.shape[1]),
+        'num_triplets': rows,
+        'num_skipped_anchors': skipped,
+        'top_k_pos': args.top_k_pos,
+        'triplets_per_anchor': args.triplets_per_anchor,
+        'positive_search_k': args.positive_search_k,
+        'positive_tmscore_min': args.positive_tmscore_min,
+        'neg_random_pool': args.neg_random_pool,
+        'negative_tmscore_max': args.negative_tmscore_max,
+        'negative_pick_strategy': args.negative_pick_strategy,
+        'max_protein_seq_length': args.max_protein_seq_length,
+        'seed': args.seed,
+        'use_faiss': faiss_enabled,
+        'exact_tm_score_structures_dir': os.path.abspath(args.exact_tm_score_structures_dir) if args.exact_tm_score_structures_dir else None,
+        'tm_score_impl': args.tm_score_impl if args.exact_tm_score_structures_dir else None,
+        'tm_score_norm': args.tm_score_norm if args.exact_tm_score_structures_dir else None,
+        'positive_score_mode': positive_score_mode,
+        'negative_score_mode': negative_score_mode,
+        'missing_exact_positive_scores': missing_exact_positive,
+        'missing_exact_negative_scores': missing_exact_negative,
+        'positive_score_summary': summarize(positive_scores_logged),
+        'negative_score_summary': summarize(negative_scores_logged),
+        'triplets_tsv_path': os.path.abspath(out_path),
+        'triplets_tsv_sha256': sha256_file(out_path),
+    }
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+
+    _log_progress(force=True)
+    elapsed = max(time.time() - start_time, 1e-9)
+    logger.info(
+        'Triplet mining finished | anchors_processed=%d | total_anchors=%d | rows_written=%d | anchors_with_triplets=%d | skipped=%d | skipped_fraction=%.4f | missing_exact_pos=%d | missing_exact_neg=%d | elapsed=%.1fs | anchors_per_sec=%.2f | rows_per_sec=%.2f | positive_score_summary=%s | negative_score_summary=%s | metadata_json=%s',
+        anchors_processed, n, rows, anchors_with_triplets, skipped, (skipped / n if n else 0.0), missing_exact_positive, missing_exact_negative, elapsed, anchors_processed / elapsed, rows / elapsed if rows > 0 else 0.0, summarize(positive_scores_logged), summarize(negative_scores_logged), meta_path
+    )
+    print(f'Wrote {rows} triplets to {out_path}')
+    print(f'Wrote metadata to {meta_path}')
+    if positive_scores_logged:
+        print('Positive score summary:', summarize(positive_scores_logged))
+    if negative_scores_logged:
+        print('Negative score summary:', summarize(negative_scores_logged))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

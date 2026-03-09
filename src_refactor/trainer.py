@@ -9,7 +9,8 @@ from typing import Optional, Tuple, Union, Dict, Any, List
 
 import torch
 import torch.nn as nn
-from torch.utils.data import RandomSampler
+import torch.nn.functional as F
+from torch.utils.data import RandomSampler, Sampler, BatchSampler
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import Trainer, PreTrainedModel, logging, BertPreTrainedModel, BertModel,T5ForConditionalGeneration
@@ -22,9 +23,9 @@ from torch.optim import AdamW
 from transformers.trainer_callback import TrainerState
 from transformers.file_utils import is_apex_available, is_sagemaker_mp_enabled
 
-from src_refactor.dataset import GoGoDataset, ProteinGoDataset, ProteinSeqDataset
+from src_refactor.dataset import GoGoDataset, ProteinGoDataset, ProteinSeqDataset, ProteinSeqTripletDataset
 from src_refactor.dataloader import DataCollatorForLanguageModeling, DataCollatorForGoGo, DataCollatorForProteinGo
-from src_refactor.models import GLProtein, KnowledgeDecoder, GLProteinLoss, TMVecLoss
+from src_refactor.models import GLProtein, KnowledgeDecoder, GLProteinLoss, TMVecLoss, GlobalStructureTripletLoss
 from src.optimization import get_scheduler
 
 
@@ -42,6 +43,174 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
 
 # Data parallelism: sharded_ddp
 # Model parallelism: deepspeed
+
+
+
+class PairBatchSampler(Sampler[List[int]]):
+    """Batch sampler that shuffles pair rows while preserving anchor/positive adjacency."""
+
+    def __init__(self, dataset, pairs_per_batch: int, generator: Optional[torch.Generator] = None, drop_last: Optional[bool] = None):
+        if pairs_per_batch <= 0:
+            raise ValueError("pairs_per_batch must be > 0")
+        if len(dataset) % 2 != 0:
+            raise ValueError("Dataset flattened length must be even")
+        self.dataset = dataset
+        self.num_pairs = len(dataset) // 2
+        self.pairs_per_batch = int(pairs_per_batch)
+        self.generator = generator
+        self.drop_last = bool(getattr(dataset, '_drop_last_for_pairs', False) if drop_last is None else drop_last)
+
+    def __iter__(self):
+        if self.generator is None:
+            perm = torch.randperm(self.num_pairs).tolist()
+        else:
+            perm = torch.randperm(self.num_pairs, generator=self.generator).tolist()
+        batch = []
+        for pair_idx in perm:
+            base_idx = 2 * pair_idx
+            batch.extend([base_idx, base_idx + 1])
+            if len(batch) == self.pairs_per_batch * 2:
+                yield batch
+                batch = []
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        if self.drop_last:
+            return self.num_pairs // self.pairs_per_batch
+        return math.ceil(self.num_pairs / self.pairs_per_batch)
+
+
+class TokenBudgetBatchSampler(BatchSampler):
+    """Batch sampler that caps padded tokens per batch using example lengths."""
+
+    def __init__(self, dataset, max_tokens: int, drop_last: bool, generator: Optional[torch.Generator] = None, bucket_size_multiplier: int = 20, max_batch_size: Optional[int] = None):
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be > 0")
+        if not hasattr(dataset, 'get_example_length'):
+            raise ValueError("TokenBudgetBatchSampler requires dataset.get_example_length(index)")
+        self.dataset = dataset
+        self.max_tokens = int(max_tokens)
+        self.drop_last = bool(drop_last)
+        self.generator = generator
+        self.max_batch_size = int(max_batch_size) if max_batch_size is not None and int(max_batch_size) > 0 else None
+        anchor_batch = self.max_batch_size if self.max_batch_size is not None else 1
+        self.bucket_size = max(anchor_batch, int(bucket_size_multiplier) * anchor_batch)
+
+    def _fits(self, current_batch: List[int], current_max_len: int, next_len: int) -> bool:
+        proposed_count = len(current_batch) + 1
+        if self.max_batch_size is not None and proposed_count > self.max_batch_size:
+            return False
+        proposed_max_len = max(current_max_len, next_len)
+        return proposed_max_len * proposed_count <= self.max_tokens
+
+    def __iter__(self):
+        n = len(self.dataset)
+        if self.generator is None:
+            perm = torch.randperm(n).tolist()
+        else:
+            perm = torch.randperm(n, generator=self.generator).tolist()
+
+        pooled_batches = []
+        for start in range(0, n, self.bucket_size):
+            pool = perm[start:start + self.bucket_size]
+            pool.sort(key=lambda idx: self.dataset.get_example_length(idx))
+
+            current_batch: List[int] = []
+            current_max_len = 0
+            for idx in pool:
+                next_len = int(self.dataset.get_example_length(idx))
+                if current_batch and not self._fits(current_batch, current_max_len, next_len):
+                    pooled_batches.append(current_batch)
+                    current_batch = []
+                    current_max_len = 0
+
+                # Always allow at least one over-budget example to form a singleton batch.
+                current_batch.append(idx)
+                current_max_len = max(current_max_len, next_len)
+
+            if current_batch:
+                pooled_batches.append(current_batch)
+
+        if self.drop_last:
+            pooled_batches = [batch for batch in pooled_batches if len(batch) > 1 or (batch and int(self.dataset.get_example_length(batch[0])) * len(batch) <= self.max_tokens)]
+
+        if pooled_batches:
+            if self.generator is None:
+                order = torch.randperm(len(pooled_batches)).tolist()
+            else:
+                order = torch.randperm(len(pooled_batches), generator=self.generator).tolist()
+            for i in order:
+                batch = pooled_batches[i]
+                if batch and (not self.drop_last or len(batch) > 0):
+                    yield batch
+
+    def __len__(self):
+        lengths = sorted(int(self.dataset.get_example_length(idx)) for idx in range(len(self.dataset)))
+        total = 0
+        current_count = 0
+        current_max_len = 0
+        for ex_len in lengths:
+            proposed_count = current_count + 1
+            proposed_max_len = max(current_max_len, ex_len)
+            exceeds_token_budget = proposed_max_len * proposed_count > self.max_tokens
+            exceeds_batch_size = self.max_batch_size is not None and proposed_count > self.max_batch_size
+            if current_count and (exceeds_token_budget or exceeds_batch_size):
+                total += 1
+                current_count = 0
+                current_max_len = 0
+                proposed_count = 1
+                proposed_max_len = ex_len
+            current_count = proposed_count
+            current_max_len = proposed_max_len
+        if current_count and not self.drop_last:
+            total += 1
+        elif current_count and total == 0:
+            total = 1
+        return total
+
+
+class LengthBucketBatchSampler(BatchSampler):
+    """Batch sampler that groups examples with similar lengths to reduce padding and VRAM spikes."""
+
+    def __init__(self, dataset, batch_size: int, drop_last: bool, generator: Optional[torch.Generator] = None, bucket_size_multiplier: int = 20):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if not hasattr(dataset, 'get_example_length'):
+            raise ValueError("LengthBucketBatchSampler requires dataset.get_example_length(index)")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.generator = generator
+        self.bucket_size = max(self.batch_size, int(bucket_size_multiplier) * self.batch_size)
+
+    def __iter__(self):
+        n = len(self.dataset)
+        if self.generator is None:
+            perm = torch.randperm(n).tolist()
+        else:
+            perm = torch.randperm(n, generator=self.generator).tolist()
+        pooled_batches = []
+        for start in range(0, n, self.bucket_size):
+            pool = perm[start:start + self.bucket_size]
+            pool.sort(key=lambda idx: self.dataset.get_example_length(idx))
+            for bstart in range(0, len(pool), self.batch_size):
+                batch = pool[bstart:bstart + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    pooled_batches.append(batch)
+        if self.generator is None:
+            order = torch.randperm(len(pooled_batches)).tolist()
+        else:
+            order = torch.randperm(len(pooled_batches), generator=self.generator).tolist()
+        for i in order:
+            batch = pooled_batches[i]
+            if len(batch) == self.batch_size or (batch and not self.drop_last):
+                yield batch
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return math.ceil(len(self.dataset) / self.batch_size)
 
 class GLProteinTrainer(Trainer):
     """
@@ -88,17 +257,18 @@ class GLProteinTrainer(Trainer):
 
         # Optional global structure component (TM-Vec loss)
         self.tmvec_loss = None
+        self.triplet_structure_loss = None
         if getattr(self.args, "use_tmvec_loss", False):
-            tm_device = self.args.tmvec_device if self.args.tmvec_device is not None else str(self.args.device)
-            self.tmvec_loss = TMVecLoss(
-                tm_vec_model_ckpt=self.args.tmvec_model_ckpt,
-                tm_vec_model_config_json=self.args.tmvec_model_config_json,
-                prot_t5_name=self.args.tmvec_prot_t5_name,
-                device=tm_device,
-                temperature=self.args.tmvec_temperature,
-                freeze=self.args.tmvec_freeze,
-                use_half=getattr(self.args, 'tmvec_use_half', False),
-            )
+            if isinstance(self.protein_seq_dataset, ProteinSeqTripletDataset):
+                self.triplet_structure_loss = GlobalStructureTripletLoss(
+                    margin=getattr(self.args, "triplet_margin", 0.2),
+                    distance_type=getattr(self.args, "triplet_distance_type", "l2"),
+                )
+            else:
+                self.tmvec_loss = TMVecLoss(
+                    temperature=self.args.tmvec_temperature,
+                    distill_weight=getattr(self.args, "tmvec_distill_weight", 0.0),
+                )
 
         self.use_amp = False
 
@@ -584,12 +754,118 @@ class GLProteinTrainer(Trainer):
         #         total_loss += mlm_loss
         #         all_loss['mlm_loss'] = mlm_loss.item()
         
-        # Add TM-Vec contrastive loss if enabled
-        if self.tmvec_loss is not None and protein_seq_inputs is not None and ("tmvec_emb" in protein_seq_inputs or "sequence" in protein_seq_inputs):
-            tmv_loss = self.tmvec_loss(model=model, **protein_seq_inputs)
+        # Add TM-Vec-supervised global structure loss if enabled.
+        if self.triplet_structure_loss is not None and protein_seq_inputs is not None:
+            triplet_loss, triplet_metrics = self._compute_triplet_structure_loss(model, protein_seq_inputs)
+            total_loss = total_loss + self.args.tmvec_weight * triplet_loss
+            all_loss["triplet_loss"] = float(triplet_loss.detach().cpu())
+            all_loss.update(triplet_metrics)
+
+        if self.tmvec_loss is not None and protein_seq_inputs is not None:
+            if "pair_id" not in protein_seq_inputs:
+                raise ValueError("use_tmvec_loss=True requires 'pair_id' in protein_seq_inputs. Use ProteinSeqPairDataset.")
+            structure_inputs = {
+                "input_ids": protein_seq_inputs["input_ids"],
+                "attention_mask": protein_seq_inputs["attention_mask"],
+                "token_type_ids": protein_seq_inputs.get("token_type_ids"),
+            }
+            student_repr = model.get_sequence_embedding(structure_inputs)
+            tmv_loss = self.tmvec_loss(
+                student_repr=student_repr,
+                pair_id=protein_seq_inputs["pair_id"].to(student_repr.device),
+                tmvec_emb=protein_seq_inputs.get("tmvec_emb"),
+            )
+
             total_loss = total_loss + self.args.tmvec_weight * tmv_loss
             all_loss["tmvec_loss"] = float(tmv_loss.detach().cpu())
+            all_loss.update(self._structure_debug_metrics(
+                student_repr=student_repr,
+                pair_id=protein_seq_inputs["pair_id"].to(student_repr.device),
+                tmvec_emb=protein_seq_inputs.get("tmvec_emb"),
+            ))
         return total_loss, all_loss
+
+    def _encode_sequence_embeddings_in_chunks(self, model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, token_type_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        microbatch_size = int(getattr(self.args, 'triplet_microbatch_size', 0) or 0)
+        if microbatch_size <= 0 or input_ids.size(0) <= microbatch_size:
+            return model.get_sequence_embedding({
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'token_type_ids': token_type_ids,
+            })
+        outputs = []
+        for start in range(0, input_ids.size(0), microbatch_size):
+            end = min(start + microbatch_size, input_ids.size(0))
+            outputs.append(model.get_sequence_embedding({
+                'input_ids': input_ids[start:end],
+                'attention_mask': attention_mask[start:end],
+                'token_type_ids': token_type_ids[start:end] if token_type_ids is not None else None,
+            }))
+        return torch.cat(outputs, dim=0)
+
+    def _compute_triplet_structure_loss(self, model: nn.Module, protein_seq_inputs: Dict[str, Union[torch.Tensor, Any]]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        anchor_repr = self._encode_sequence_embeddings_in_chunks(
+            model,
+            protein_seq_inputs['anchor_input_ids'],
+            protein_seq_inputs.get('anchor_attention_mask', protein_seq_inputs['attention_mask']),
+            protein_seq_inputs.get('anchor_token_type_ids', protein_seq_inputs.get('token_type_ids')),
+        )
+        positive_repr = self._encode_sequence_embeddings_in_chunks(
+            model,
+            protein_seq_inputs['positive_input_ids'],
+            protein_seq_inputs['positive_attention_mask'],
+            protein_seq_inputs.get('positive_token_type_ids'),
+        )
+        negative_repr = self._encode_sequence_embeddings_in_chunks(
+            model,
+            protein_seq_inputs['negative_input_ids'],
+            protein_seq_inputs['negative_attention_mask'],
+            protein_seq_inputs.get('negative_token_type_ids'),
+        )
+        triplet_loss = self.triplet_structure_loss(anchor_repr, positive_repr, negative_repr)
+        metrics = self._triplet_debug_metrics(anchor_repr, positive_repr, negative_repr)
+        return triplet_loss, metrics
+
+    def _triplet_debug_metrics(self, anchor_repr: torch.Tensor, positive_repr: torch.Tensor, negative_repr: torch.Tensor) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        with torch.no_grad():
+            if getattr(self.args, 'triplet_distance_type', 'l2') == 'cosine':
+                pos_dist = 1.0 - F.cosine_similarity(anchor_repr.float(), positive_repr.float(), dim=1)
+                neg_dist = 1.0 - F.cosine_similarity(anchor_repr.float(), negative_repr.float(), dim=1)
+            else:
+                pos_dist = torch.norm(anchor_repr.float() - positive_repr.float(), p=2, dim=1)
+                neg_dist = torch.norm(anchor_repr.float() - negative_repr.float(), p=2, dim=1)
+            margin = float(getattr(self.args, 'triplet_margin', 0.2))
+            violations = (pos_dist - neg_dist + margin > 0).float()
+            metrics['anchor_pos_distance_mean'] = float(pos_dist.mean().detach().cpu())
+            metrics['anchor_neg_distance_mean'] = float(neg_dist.mean().detach().cpu())
+            metrics['triplet_margin_violation_rate'] = float(violations.mean().detach().cpu())
+            metrics['anchor_repr_norm_mean'] = float(anchor_repr.norm(dim=1).mean().detach().cpu())
+        return metrics
+
+    def _structure_debug_metrics(self, student_repr: torch.Tensor, pair_id: torch.Tensor, tmvec_emb: Optional[torch.Tensor] = None) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        with torch.no_grad():
+            z = F.normalize(student_repr.float(), dim=1)
+            sim = z @ z.t()
+            eye = torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+            pos_mask = pair_id.unsqueeze(0).eq(pair_id.unsqueeze(1)) & (~eye)
+            neg_mask = ~pair_id.unsqueeze(0).eq(pair_id.unsqueeze(1))
+            metrics["student_repr_norm_mean"] = float(student_repr.norm(dim=1).mean().detach().cpu())
+            if pos_mask.any():
+                metrics["student_pos_sim_mean"] = float(sim[pos_mask].mean().detach().cpu())
+            if neg_mask.any():
+                metrics["student_nonpair_sim_mean"] = float(sim[neg_mask].mean().detach().cpu())
+            if tmvec_emb is not None:
+                if not torch.is_tensor(tmvec_emb):
+                    tmvec_emb = torch.as_tensor(tmvec_emb, dtype=student_repr.dtype, device=student_repr.device)
+                tm = F.normalize(tmvec_emb.float().to(student_repr.device), dim=1)
+                tsim = tm @ tm.t()
+                if pos_mask.any():
+                    metrics["teacher_pos_sim_mean"] = float(tsim[pos_mask].mean().detach().cpu())
+                if neg_mask.any():
+                    metrics["teacher_nonpair_sim_mean"] = float(tsim[neg_mask].mean().detach().cpu())
+        return metrics
 
     def num_examples(self, dataloader: DataLoader) -> int:
         num_examples = 0
@@ -726,14 +1002,88 @@ class GLProteinTrainer(Trainer):
         protein_seq_sampler, protein_go_sampler = self._get_train_sampler()
 
         if self.protein_seq_dataset:
-            protein_seq_dataloader = DataLoader(
-                dataset=self.protein_seq_dataset,
-                batch_size=self.args.train_protein_seq_batch_size,
-                collate_fn=self.protein_seq_data_collator,
-                pin_memory=self.args.dataloader_pin_memory,
-                drop_last=self.args.dataloader_drop_last,
-                sampler=protein_seq_sampler,
-            )
+            if self.tmvec_loss is not None and hasattr(self.protein_seq_dataset, "pairs"):
+                if self.args.world_size > 1:
+                    raise NotImplementedError("Pair-preserving TM-Vec batching is not implemented for distributed training")
+                if self.args.train_protein_seq_batch_size % 2 != 0:
+                    raise ValueError("use_tmvec_loss=True but per-device protein sequence batch size is not even")
+                if self.args.train_protein_seq_batch_size < 4:
+                    raise ValueError(
+                        "use_tmvec_loss=True requires per_device_train_batch_size >= 4"
+                    )
+                num_pairs = len(self.protein_seq_dataset) // 2
+                pairs_per_batch = self.args.train_protein_seq_batch_size // 2
+                remainder_pairs = num_pairs % pairs_per_batch
+                if (not self.args.dataloader_drop_last) and remainder_pairs == 1:
+                    raise ValueError(
+                        "The final batch contains only one pair. Set dataloader_drop_last=True, "
+                        "increase protein_seq_sample_limit / mined pairs, or change the batch size."
+                    )
+                generator = None
+                if _is_torch_generator_available:
+                    generator = torch.Generator()
+                    generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+                self.protein_seq_dataset._drop_last_for_pairs = bool(self.args.dataloader_drop_last)
+                batch_sampler = PairBatchSampler(
+                    self.protein_seq_dataset,
+                    pairs_per_batch=self.args.train_protein_seq_batch_size // 2,
+                    generator=generator,
+                )
+                protein_seq_dataloader = DataLoader(
+                    dataset=self.protein_seq_dataset,
+                    batch_sampler=batch_sampler,
+                    collate_fn=self.protein_seq_data_collator,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+            else:
+                batch_sampler = None
+                if getattr(self.args, 'max_tokens_per_batch', 0):
+                    if self.args.world_size > 1:
+                        logger.warning('max_tokens_per_batch is ignored for distributed training, using the default sampler instead')
+                    elif hasattr(self.protein_seq_dataset, 'get_example_length'):
+                        generator = None
+                        if _is_torch_generator_available:
+                            generator = torch.Generator()
+                            generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+                        batch_sampler = TokenBudgetBatchSampler(
+                            self.protein_seq_dataset,
+                            max_tokens=int(getattr(self.args, 'max_tokens_per_batch', 0)),
+                            max_batch_size=self.args.train_protein_seq_batch_size,
+                            drop_last=self.args.dataloader_drop_last,
+                            generator=generator,
+                            bucket_size_multiplier=getattr(self.args, 'length_bucket_size_multiplier', 20),
+                        )
+                elif getattr(self.args, 'length_bucketed_batches', False):
+                    if self.args.world_size > 1:
+                        logger.warning('length_bucketed_batches is ignored for distributed training, using the default sampler instead')
+                    elif hasattr(self.protein_seq_dataset, 'get_example_length'):
+                        generator = None
+                        if _is_torch_generator_available:
+                            generator = torch.Generator()
+                            generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+                        batch_sampler = LengthBucketBatchSampler(
+                            self.protein_seq_dataset,
+                            batch_size=self.args.train_protein_seq_batch_size,
+                            drop_last=self.args.dataloader_drop_last,
+                            generator=generator,
+                            bucket_size_multiplier=getattr(self.args, 'length_bucket_size_multiplier', 20),
+                        )
+                if batch_sampler is not None:
+                    protein_seq_dataloader = DataLoader(
+                        dataset=self.protein_seq_dataset,
+                        batch_sampler=batch_sampler,
+                        collate_fn=self.protein_seq_data_collator,
+                        pin_memory=self.args.dataloader_pin_memory,
+                    )
+                else:
+                    protein_seq_dataloader = DataLoader(
+                        dataset=self.protein_seq_dataset,
+                        batch_size=self.args.train_protein_seq_batch_size,
+                        collate_fn=self.protein_seq_data_collator,
+                        pin_memory=self.args.dataloader_pin_memory,
+                        drop_last=self.args.dataloader_drop_last,
+                        sampler=protein_seq_sampler,
+                    )
 
         if self.protein_go_dataset:
             protein_go_dataloader = DataLoader(

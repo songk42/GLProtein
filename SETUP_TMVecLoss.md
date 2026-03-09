@@ -1,16 +1,9 @@
-# Setup instructions for GLProtein (refactor) + TMVecLoss wiring
-
-These steps prepare the environment and required data to run:
-
-- `run_pretrain_refactor.py` (MLM-only) or
-- `run_pretrain_refactor.py` with `--use_tmvec_loss True` (adds global structure TM-Vec contrastive loss)
-
----
+# GLProtein + Global Structure Triplet Loss
 
 ## (0) Prerequisites
 
 - Python 3.9+
-- A CUDA GPU is required for TM-Vec encoding with `Rostlab/prot_t5_xl_uniref50`.
+- CUDA GPU
 - To use Google Colab, upload `GLProtein_TMVec_Colab.ipynb` and follow its instructions.
 
 ---
@@ -27,7 +20,7 @@ python -m pip install --upgrade pip wheel setuptools
 
 ---
 
-## (2) Install base dependencies
+## (2) Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -35,86 +28,120 @@ pip install -r requirements.txt
 
 ---
 
-## (3) Install TM-Vec from GitHub
+---
 
-```bash
-pip install git+https://github.com/tymor22/tm-vec.git
-python -c "import tm_vec; print('tm_vec imported OK')"
-```
+## (3) Obtain Data
+
+Construction of global structure triplets needs the following files:
+
+- `swiss_large.npy`: TM-Vec embeddings of SwissProt
+- `swissprot_seq.fasta`: Annotated sequences of SwissProt
+
+Download them from https://zenodo.org/records/11199459 and place them in `/data/pretrain_data`.
+
+Pre-training needs the following file:
+- `swissprot_pdb_v6.tar`: PDB files of SwissProt
+
+Download it from https://alphafold.ebi.ac.uk/download#swissprot-section and place it in `/data/pretrain_data`.
 
 ---
 
-## (4) Obtain TM-Vec checkpoint + config JSON
+## (4) Triplet Construction Test
 
-`TMVecLoss` needs the following files:
+Run the following to construct `tmvec_triplets_small.tsv` in `/data/pretrain_data`:
 
-- `tm_vec_model_ckpt`: TM-Vec model checkpoint
-- `tm_vec_model_config_json`: TM-Vec model params JSON
-
-Download them from https://figshare.com/s/e414d6a52fd471d86d69 and place them in `/assets/tmvec`.
-
-Pass these paths to `run_pretrain_refactor.py`:
-- `--tmvec_model_ckpt assets/tmvec/tm_vec_cath_model.ckpt`
-- `--tmvec_model_config_json assets/tmvec/tm_vec_cath_model_params.json`
-
----
-
-## (5) Prepare data
-
-Download UniProt data from https://drive.google.com/file/d/1fsfE8kG6oBJor7tr2RJfOyFGAMj6woVM, decompress it and save it in `/data/pretrain_data`.
-
-Run the following to create the TSV and NPY files for TM-Vec in `/data/pretrain_data`:
 ```bash
 python generate_tmvec_pairs_tsv.py \
-  --uniprot_dat data/pretrain_data/uniprot_sprot.dat \
-  --out_tsv data/pretrain_data/tmvec_pairs.tsv \
-  --out_emb_npy data/pretrain_data/tmvec_pairs_emb.npy \
-  --tmvec_ckpt assets/tmvec/tm_vec_cath_model.ckpt \
-  --tmvec_config assets/tmvec/tm_vec_cath_model_params.json \
-  --device cuda \
-  --top_k 5 \
+  --swiss_fasta data/pretrain_data/swissprot_seq.fasta \
+  --swiss_tmvec_emb_npy data/pretrain_data/swiss_large.npy \
+  --out_tsv data/pretrain_data/tmvec_triplets_small.tsv \
+  --out_metadata_json data/pretrain_data/tmvec_triplets_small.metadata.json \
+  --top_k_pos 5 \
+  --triplets_per_anchor 1 \
+  --positive_search_k 64 \
+  --negative_tmscore_max 0.2 \
+  --negative_pick_strategy hardest \
   --use_faiss \
   --seed 2021 \
-  --embed_checkpoint_dir embed_ckpt \
-  --resume_embeddings \
-  --max_proteins 1000
+  --max_proteins 15000 \
+  --log_every_anchors 1000
 ```
 
 ---
 
-## (6) Verify pretraining with TMVecLoss
+## (5) Pre-Training Test
+
 ```bash
 python run_pretrain_refactor.py \
-  --output_dir outputs/mlm_plus_tmvec_precomputed \
+  --output_dir outputs/glprotein_triplet_small \
+  --pretrain_data_dir data/pretrain_data \
+  --model_protein_seq_data True \
   --use_tmvec_loss True \
-  --tmvec_pairs_tsv tmvec_pairs.tsv \
-  --tmvec_pairs_emb_npy tmvec_pairs_emb.npy \
-  --per_device_train_batch_size 4 \
+  --tmvec_triplets_tsv tmvec_triplets_small.tsv \
   --weight_decay 0.01 \
-  --optimize_memory True \
   --lr_scheduler_type linear \
   --lm_learning_rate 1e-5 \
   --lm_warmup_ratio 0.167 \
-  --seed 2021 \
   --fp16 \
   --dataloader_pin_memory \
-  --max_steps 10 \
-  --gradient_accumulation_steps 2 \
-  --protein_seq_sample_limit 8
+  --seed 2021 \
+  --per_device_train_batch_size 2 \
+  --logging_steps 1 \
+  --save_steps 10 \
+  --max_steps 30 \
+  --gradient_accumulation_steps 5 \
+  --gradient_checkpointing True \
+  --triplet_microbatch_size 1 \
+  --max_tokens_per_batch 4096 \
+  --max_protein_seq_length 1024
 ```
 
 ---
 
-## (7) Full pretraining
+## (6) Full triplet construction
 
-> Note: The following arguments have not been tested.
-
-To prepare the full dataset for TMVecLoss, run `generate_tmvec_pairs_tsv.py` without `--max_proteins`.
-
-To run full pretraining, run `run_pretrain_refactor.py` with `--max_steps 300000`, `--gradient_accumulation_steps 256` and no `--protein_seq_sample_limit`.
+```bash
+python generate_tmvec_pairs_tsv.py \
+  --swiss_fasta data/pretrain_data/swissprot_seq.fasta \
+  --swiss_tmvec_emb_npy data/pretrain_data/swiss_large.npy \
+  --out_tsv data/pretrain_data/tmvec_triplets_full.tsv \
+  --out_metadata_json data/pretrain_data/tmvec_triplets_full.metadata.json \
+  --top_k_pos 5 \
+  --triplets_per_anchor 1 \
+  --positive_search_k 64 \
+  --negative_tmscore_max 0.2 \
+  --negative_pick_strategy hardest \
+  --use_faiss \
+  --seed 2021 \
+  --max_proteins 300000 \
+  --log_every_anchors 100
+```
 
 ---
 
-## (8) Troubleshooting
-- If you see an error about `sequence` missing, you are not using `ProteinSeqPairDataset` (or your collator did not pass through `sequence`).
-- If you see an error about batch size needing to be even, set `--per_device_train_batch_size` to an even number.
+## (7) Full pre-training
+
+```bash
+python run_pretrain_refactor.py \
+  --output_dir outputs/glprotein_triplet_full \
+  --pretrain_data_dir data/pretrain_data \
+  --model_protein_seq_data True \
+  --use_tmvec_loss True \
+  --tmvec_triplets_tsv tmvec_triplets_full.tsv \
+  --weight_decay 0.01 \
+  --lr_scheduler_type linear \
+  --lm_learning_rate 1e-5 \
+  --lm_warmup_ratio 0.167 \
+  --fp16 \
+  --dataloader_pin_memory \
+  --seed 2021 \
+  --per_device_train_batch_size 4 \
+  --logging_steps 10 \
+  --save_steps 500 \
+  --max_steps 300000 \
+  --gradient_accumulation_steps 256 \
+  --gradient_checkpointing True \
+  --triplet_microbatch_size 1 \
+  --max_tokens_per_batch 4096 \
+  --max_protein_seq_length 1024
+```

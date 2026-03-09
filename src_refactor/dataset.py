@@ -5,6 +5,8 @@ import time
 import lmdb
 import torch
 import json
+import hashlib
+import logging
 import numpy as np
 import pickle as pkl
 import dataclasses
@@ -28,6 +30,19 @@ from itertools import islice
 
 
 
+
+
+logger = logging.getLogger(__name__)
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+def _tmvec_sidecar_json_path(npy_path: str) -> str:
+    if npy_path.endswith('.npy'):
+        return npy_path[:-4] + '.metadata.json'
+    return npy_path + '.metadata.json'
 
 
 ## cart2sph
@@ -494,6 +509,7 @@ class ProteinSeqDataset(Dataset):
 
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
+        self.sequence_lengths = [min(len(seq.split()), self.max_protein_seq_length) if self.max_protein_seq_length is not None else len(seq.split()) for seq in self.protein_seq]
         # self.protein_cor = pickle.load(open('./ProteinKG25/id2cor_dict.pkl', 'rb'))
         
     def __getitem__(self, index):
@@ -529,6 +545,9 @@ class ProteinSeqDataset(Dataset):
     def __len__(self):
         # return self.num_examples
         return len(self.protein_seq)
+
+    def get_example_length(self, index: int) -> int:
+        return int(self.sequence_lengths[index])
     
     # def get_distance_matrix(self,index):
     #     item = self.protein_cor[index]
@@ -552,6 +571,8 @@ class ProteinSeqPairInputFeatures:
     """
     input_ids: List[int]
     sequence: str
+    pair_id: int
+    view_id: int
     tmvec_emb: Optional[List[float]] = None
 
 
@@ -582,6 +603,7 @@ class ProteinSeqPairDataset(Dataset):
         self.pairs_tsv = pairs_tsv
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
+        self.sequence_lengths = [min(len(seq.split()), self.max_protein_seq_length) if self.max_protein_seq_length is not None else len(seq.split()) for seq in self.protein_seq]
 
         if not os.path.isabs(self.pairs_tsv):
             self.pairs_tsv = os.path.join(self.data_dir, self.pairs_tsv)
@@ -640,6 +662,41 @@ class ProteinSeqPairDataset(Dataset):
         if len(self.pairs) == 0:
             raise ValueError("No pairs loaded from TSV")
 
+        duplicate_pairs = len(self.pairs) - len(set(self.pairs))
+        if duplicate_pairs > 0:
+            logger.warning("Found %s duplicate anchor/positive rows", duplicate_pairs)
+        identical_pairs = sum(1 for a, b in self.pairs if a == b)
+        if identical_pairs > 0:
+            logger.warning("Found %s identical pairs", identical_pairs)
+        repeated_anchor_count = len(self.pairs) - len({a for a, _ in self.pairs})
+        if repeated_anchor_count > 0:
+            logger.warning("Found %s repeated pairs", repeated_anchor_count)
+        if self._has_tmvec:
+            sidecar_path = _tmvec_sidecar_json_path(tmvec_path)
+            if os.path.exists(sidecar_path):
+                try:
+                    meta = json.load(open(sidecar_path, 'r', encoding='utf-8'))
+                    expected_pairs_sha = _sha256_file(self.pairs_tsv)
+                    meta_pairs_sha = meta.get('pairs_tsv_sha256')
+                    if meta_pairs_sha and meta_pairs_sha != expected_pairs_sha:
+                        logger.warning(
+                            "pairs_tsv_sha256 mismatch (metadata: %s, TSV: %s)",
+                            meta_pairs_sha,
+                            expected_pairs_sha,
+                        )
+                    if self.max_protein_seq_length is not None and meta.get('max_protein_seq_length') not in (None, self.max_protein_seq_length):
+                        logger.warning("max_protein_seq_length mismatch (metadata: %s, training: %s)",
+                            meta.get('max_protein_seq_length'),
+                            self.max_protein_seq_length,
+                        )
+                except Exception as e:
+                    logger.warning("Failed to read TM-Vec metadata sidecar: %s", e)
+        if self._has_tmvec and self.max_protein_seq_length is not None:
+            logger.warning(
+                "Possible mismatch with precomputed embeddings due to max_protein_seq_length=%s",
+                self.max_protein_seq_length,
+            )
+
     def __len__(self) -> int:
         # each pair yields 2 examples (anchor then positive)
         return len(self.pairs) * 2
@@ -661,9 +718,147 @@ class ProteinSeqPairDataset(Dataset):
                 tmvec_emb = self._tmvec_emb[pair_idx, anchor_or_positive].tolist()
             else:
                 tmvec_emb = self._tmvec_emb[index].tolist()
+        return ProteinSeqPairInputFeatures(
+            input_ids=input_ids,
+            sequence=seq,
+            pair_id=pair_idx,
+            view_id=anchor_or_positive,
+            tmvec_emb=tmvec_emb,
+        )
 
-        return ProteinSeqPairInputFeatures(input_ids=input_ids, sequence=seq, tmvec_emb=tmvec_emb)
 
+@dataclass
+class ProteinSeqTripletInputFeatures:
+    """A set of features for anchor/positive/negative protein triplets."""
+    anchor_input_ids: List[int]
+    positive_input_ids: List[int]
+    negative_input_ids: List[int]
+    anchor_sequence: str
+    positive_sequence: str
+    negative_sequence: str
+    anchor_id: Optional[str] = None
+    positive_id: Optional[str] = None
+    negative_id: Optional[str] = None
+    positive_score: Optional[float] = None
+    negative_score: Optional[float] = None
+
+
+class ProteinSeqTripletDataset(Dataset):
+    """
+    Dataset yielding one explicit (anchor, positive, negative) triplet per item.
+    Expected TSV columns:
+      required: anchor_seq, positive_seq, negative_seq
+      optional: anchor_id, positive_id, negative_id, positive_score, negative_score
+    The file may be either headerless with at least 3 tab-separated columns or a
+    headered TSV using the names above.
+    """
+    def __init__(
+        self,
+        data_dir: str,
+        triplets_tsv: str,
+        tokenizer: PreTrainedTokenizerBase,
+        max_protein_seq_length: Optional[int] = None,
+        protein_seq_sample_limit: Optional[int] = None,
+    ):
+        def trans_sequence(sequence: str) -> str:
+            sequence = " ".join(sequence.strip())
+            sequence = re.sub(r"[UZOB]", "X", sequence)
+            return sequence
+        self.data_dir = data_dir
+        self.triplets_tsv = triplets_tsv
+        self.tokenizer = tokenizer
+        self.max_protein_seq_length = max_protein_seq_length
+        if not os.path.isabs(self.triplets_tsv):
+            self.triplets_tsv = os.path.join(self.data_dir, self.triplets_tsv)
+        if not os.path.exists(self.triplets_tsv):
+            raise FileNotFoundError(f"Triplet TSV not found: {self.triplets_tsv}")
+        self.triplets = []
+        with open(self.triplets_tsv, "r", encoding="utf-8") as f:
+            first_line = f.readline()
+            if not first_line:
+                raise ValueError("Triplet TSV is empty")
+            first_parts = [x.strip() for x in first_line.rstrip("\n").split("\t")]
+            has_header = {"anchor_seq", "positive_seq", "negative_seq"}.issubset(set(first_parts))
+            def _parse_parts(parts, headers=None):
+                if headers is None:
+                    if len(parts) < 3:
+                        raise ValueError("Triplet TSV rows must have at least 3 columns")
+                    return {
+                        "anchor_seq": parts[0].strip(),
+                        "positive_seq": parts[1].strip(),
+                        "negative_seq": parts[2].strip(),
+                    }
+                row = {h: (parts[i].strip() if i < len(parts) else "") for i, h in enumerate(headers)}
+                return row
+            if has_header:
+                headers = first_parts
+            else:
+                headers = None
+                row = _parse_parts(first_parts, headers=None)
+                self.triplets.append({
+                    "anchor_seq": trans_sequence(row["anchor_seq"]),
+                    "positive_seq": trans_sequence(row["positive_seq"]),
+                    "negative_seq": trans_sequence(row["negative_seq"]),
+                    "anchor_id": None,
+                    "positive_id": None,
+                    "negative_id": None,
+                    "positive_score": None,
+                    "negative_score": None,
+                })
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("	")
+                row = _parse_parts(parts, headers=headers)
+                self.triplets.append({
+                    "anchor_seq": trans_sequence(row["anchor_seq"]),
+                    "positive_seq": trans_sequence(row["positive_seq"]),
+                    "negative_seq": trans_sequence(row["negative_seq"]),
+                    "anchor_id": row.get("anchor_id") or None,
+                    "positive_id": row.get("positive_id") or None,
+                    "negative_id": row.get("negative_id") or None,
+                    "positive_score": float(row["positive_score"]) if row.get("positive_score") not in (None, "") else None,
+                    "negative_score": float(row["negative_score"]) if row.get("negative_score") not in (None, "") else None,
+                })
+        if protein_seq_sample_limit is not None:
+            self.triplets = self.triplets[:protein_seq_sample_limit]
+        if len(self.triplets) == 0:
+            raise ValueError("No triplets loaded from TSV")
+        self.example_lengths = [
+            max(len(row['anchor_seq'].split()), len(row['positive_seq'].split()), len(row['negative_seq'].split()))
+            for row in self.triplets
+        ]
+    def __len__(self) -> int:
+        return len(self.triplets)
+
+    def get_example_length(self, index: int) -> int:
+        length = int(self.example_lengths[index])
+        if self.max_protein_seq_length is not None:
+            return min(length, int(self.max_protein_seq_length))
+        return length
+    def _truncate(self, seq: str) -> str:
+        if self.max_protein_seq_length is None:
+            return seq
+        return " ".join(seq.split()[: self.max_protein_seq_length])
+    def __getitem__(self, index: int) -> ProteinSeqTripletInputFeatures:
+        row = self.triplets[index]
+        anchor_seq = self._truncate(row["anchor_seq"])
+        positive_seq = self._truncate(row["positive_seq"])
+        negative_seq = self._truncate(row["negative_seq"])
+        return ProteinSeqTripletInputFeatures(
+            anchor_input_ids=self.tokenizer.encode(anchor_seq, add_special_tokens=True),
+            positive_input_ids=self.tokenizer.encode(positive_seq, add_special_tokens=True),
+            negative_input_ids=self.tokenizer.encode(negative_seq, add_special_tokens=True),
+            anchor_sequence=anchor_seq,
+            positive_sequence=positive_seq,
+            negative_sequence=negative_seq,
+            anchor_id=row.get("anchor_id"),
+            positive_id=row.get("positive_id"),
+            negative_id=row.get("negative_id"),
+            positive_score=row.get("positive_score"),
+            negative_score=row.get("negative_score"),
+        )
 
 class GoGoDataset(Dataset):
     """

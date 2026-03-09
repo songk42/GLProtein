@@ -9,7 +9,7 @@ from transformers import BertTokenizer, AutoTokenizer, logging
 from src_refactor.models import GLProtein, GLProteinConfig, KnowledgeDecoder
 from src_refactor.trainer import GLProteinTrainer
 from src.sampling import negative_sampling_strategy
-from src_refactor.dataset import ProteinSeqDataset, ProteinSeqPairDataset, ProteinGoDataset
+from src_refactor.dataset import ProteinSeqDataset, ProteinSeqPairDataset, ProteinSeqTripletDataset, ProteinGoDataset
 from src_refactor.dataloader import DataCollatorForGoGo, DataCollatorForLanguageModeling, DataCollatorForProteinGo
 from src_refactor.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
 
@@ -72,16 +72,27 @@ def main():
         )
     elif data_args.model_protein_seq_data:
         if training_args.use_tmvec_loss:
-            if data_args.tmvec_pairs_tsv is None:
-                raise ValueError("use_tmvec_loss=True but data_args.tmvec_pairs_tsv is None")
-            protein_seq_dataset = ProteinSeqPairDataset(
-                data_dir=data_args.pretrain_data_dir,
-                pairs_tsv=data_args.tmvec_pairs_tsv,
-                tmvec_emb_npy=data_args.tmvec_pairs_emb_npy,
-                tokenizer=protein_tokenizer,
-                max_protein_seq_length=data_args.max_protein_seq_length,
-                protein_seq_sample_limit=data_args.protein_seq_sample_limit,
-            )
+            if data_args.tmvec_triplets_tsv is not None:
+                protein_seq_dataset = ProteinSeqTripletDataset(
+                    data_dir=data_args.pretrain_data_dir,
+                    triplets_tsv=data_args.tmvec_triplets_tsv,
+                    tokenizer=protein_tokenizer,
+                    max_protein_seq_length=data_args.max_protein_seq_length,
+                    protein_seq_sample_limit=data_args.protein_seq_sample_limit,
+                )
+            else:
+                if data_args.tmvec_pairs_tsv is None:
+                    raise ValueError("use_tmvec_loss=True requires data_args.tmvec_triplets_tsv or data_args.tmvec_pairs_tsv")
+                if training_args.per_device_train_batch_size % 2 != 0:
+                    raise ValueError("Legacy pair TMVecLoss path requires an even per_device_train_batch_size")
+                protein_seq_dataset = ProteinSeqPairDataset(
+                    data_dir=data_args.pretrain_data_dir,
+                    pairs_tsv=data_args.tmvec_pairs_tsv,
+                    tmvec_emb_npy=data_args.tmvec_pairs_emb_npy,
+                    tokenizer=protein_tokenizer,
+                    max_protein_seq_length=data_args.max_protein_seq_length,
+                    protein_seq_sample_limit=data_args.protein_seq_sample_limit,
+                )
         else:
             protein_seq_dataset = ProteinSeqDataset(
                 data_dir=data_args.pretrain_data_dir,
@@ -114,6 +125,31 @@ def main():
         # num_go_terms=num_go_terms,
         # num_proteins=num_proteins,
     )
+
+    if training_args.gradient_checkpointing:
+        if hasattr(model.encoder, 'gradient_checkpointing_enable'):
+            model.encoder.gradient_checkpointing_enable()
+            if hasattr(model.encoder.config, 'use_cache'):
+                model.encoder.config.use_cache = False
+            logger.warning('Enabled encoder gradient checkpointing.')
+        else:
+            logger.warning('gradient_checkpointing=True but encoder does not expose gradient_checkpointing_enable().')
+
+    logger.warning(
+        'Startup config | dataset=%s | use_tmvec_loss=%s | global_structure_weight=%s | triplet_margin=%s | triplet_microbatch_size=%s | length_bucketed_batches=%s | max_tokens_per_batch=%s | gradient_checkpointing=%s | max_protein_seq_length=%s | protein_seq_sample_limit=%s',
+        type(protein_seq_dataset).__name__ if protein_seq_dataset is not None else None,
+        training_args.use_tmvec_loss,
+        training_args.global_structure_weight,
+        getattr(training_args, 'triplet_margin', None),
+        getattr(training_args, 'triplet_microbatch_size', None),
+        getattr(training_args, 'length_bucketed_batches', None),
+        getattr(training_args, 'max_tokens_per_batch', None),
+        training_args.gradient_checkpointing,
+        data_args.max_protein_seq_length,
+        data_args.protein_seq_sample_limit,
+    )
+    if protein_seq_dataset is not None:
+        logger.warning('Loaded %s protein-sequence training examples.', len(protein_seq_dataset))
 
     # prepare Trainer
     trainer = GLProteinTrainer(

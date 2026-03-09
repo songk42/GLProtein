@@ -876,6 +876,26 @@ class GLProtein(nn.Module):
             neg_pfi_logits=neg_pfi_prediction
         )
 
+    def get_sequence_embedding(self, protein_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return one differentiable sequence embedding per protein sequence."""
+        protein_input_ids = protein_inputs["input_ids"]
+        protein_attention_mask = protein_inputs["attention_mask"]
+        protein_token_type_ids = protein_inputs.get("token_type_ids", None)
+
+        protein_outputs = self.encoder(
+            input_ids=protein_input_ids,
+            attention_mask=protein_attention_mask,
+            token_type_ids=protein_token_type_ids,
+            output_hidden_states=False,
+            return_dict=True,
+            output_attentions=False,
+        )
+        token_embeddings = protein_outputs.last_hidden_state
+        attention_mask = protein_attention_mask.unsqueeze(-1).to(token_embeddings.dtype)
+        pooled = (token_embeddings * attention_mask).sum(dim=1)
+        denom = attention_mask.sum(dim=1).clamp(min=1.0)
+        return pooled / denom
+
 
     def save_pretrained(self,save_directory: os.PathLike,state_dict: Optional[dict] = None,save_config: bool = True,
     ):
@@ -1084,110 +1104,112 @@ def copy_layers(src_layers, dest_layers, layers_to_copy):
 
 
 @dataclass
+class GlobalStructureTripletLoss:
+    """Paper-style margin triplet loss on pooled protein sequence embeddings."""
+
+    margin: float = 0.2
+    distance_type: str = "l2"
+
+    def __init__(self, margin: float = 0.2, distance_type: str = "l2"):
+        self.margin = float(margin)
+        self.distance_type = str(distance_type).lower()
+        if self.distance_type not in {"l2", "cosine"}:
+            raise ValueError("distance_type must be 'l2' or 'cosine'")
+
+    def _distance(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if self.distance_type == "cosine":
+            return 1.0 - F.cosine_similarity(x.float(), y.float(), dim=1)
+        return torch.norm(x.float() - y.float(), p=2, dim=1)
+
+    def __call__(self, anchor_repr: torch.Tensor, positive_repr: torch.Tensor, negative_repr: torch.Tensor) -> torch.Tensor:
+        if anchor_repr.shape != positive_repr.shape or anchor_repr.shape != negative_repr.shape:
+            raise ValueError(
+                f"Triplet repr shape mismatch: {tuple(anchor_repr.shape)}, {tuple(positive_repr.shape)}, {tuple(negative_repr.shape)}"
+            )
+        pos_dist = self._distance(anchor_repr, positive_repr)
+        neg_dist = self._distance(anchor_repr, negative_repr)
+        loss = torch.relu(pos_dist - neg_dist + self.margin).mean()
+        if not torch.isfinite(loss):
+            raise ValueError("Triplet/global-structure loss became non-finite")
+        return loss
+
+
+@dataclass
 class TMVecLoss:
     """
-    Global structure component: TM-Vec contrastive loss on paired sequences.
+    Global structure loss computed on GLProtein sequence embeddings.
 
-    Note: The current implementation assumes paired batches:
-        (0, 1), (2, 3), ... are positive pairs.
-
-    It uses the tm-vec repo (https://github.com/tymor22/tm-vec) to:
-      - load a TM-Vec model checkpoint
-      - encode sequences into structural embeddings
-    
-    Supports usage of precomputed embeddings when `tmvec_emb` is provided
+    Optional TM-Vec embeddings are treated as teacher targets
+    for similarity distillation. Contrastive loss is computed on
+    the embeddings produced by the model being trained.
     """
 
     def __init__(
         self,
-        tm_vec_model_ckpt: str | None = None,
-        tm_vec_model_config_json: str | None = None,
-        prot_t5_name: str = "Rostlab/prot_t5_xl_uniref50",
-        device: str = "cuda",
-        temperature: float = 20.0,
-        freeze: bool = True,
-        use_half: bool = False,
+        temperature: float = 0.07,
+        distill_weight: float = 0.0,
     ):
         self.temperature = float(temperature)
-        self.loss_func = nn.CrossEntropyLoss()
+        self.distill_weight = float(distill_weight)
 
-        # Online encoding components for TMVec
-        self._online_ready = False
-        self._tm_vec_model_ckpt = tm_vec_model_ckpt
-        self._tm_vec_model_config_json = tm_vec_model_config_json
-        self._prot_t5_name = prot_t5_name
-        self._device = device
-        self._freeze = bool(freeze)
-        self._use_half = bool(use_half)
+    def _pairwise_contrastive_loss(self, student_repr: torch.Tensor, pair_id: torch.Tensor) -> torch.Tensor:
+        if student_repr.ndim != 2:
+            raise ValueError(f"Expected 2D student embeddings, got shape {tuple(student_repr.shape)}")
+        if pair_id.ndim != 1 or pair_id.shape[0] != student_repr.shape[0]:
+            raise ValueError("pair_id must be a 1D tensor aligned with the batch dimension")
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
 
-        self.T5_encoder = None
-        self.T5_tokenizer = None
-        self.model_deep = None
+        z = F.normalize(student_repr.float(), dim=1)
+        logits = torch.matmul(z, z.transpose(0, 1)) / self.temperature
+        batch_size = logits.shape[0]
+        eye = torch.eye(batch_size, device=logits.device, dtype=torch.bool)
+        valid_mask = ~eye
 
-    def _ensure_online_encoder(self):
-        if self._online_ready:
-            return
-        if encode is None or trans_basic_block is None or trans_basic_block_Config is None:
-            raise ImportError("Failed to import TM-Vec")
-        if self._tm_vec_model_ckpt is None or self._tm_vec_model_config_json is None:
-            raise ValueError("No tm_vec_model_ckpt/tm_vec_model_config_json")
+        positive_mask = pair_id.unsqueeze(0).eq(pair_id.unsqueeze(1))
+        positive_mask = positive_mask & valid_mask
+        positive_counts = positive_mask.sum(dim=1)
+        if torch.any(positive_counts == 0):
+            bad = torch.nonzero(positive_counts == 0, as_tuple=False).view(-1).tolist()
+            raise ValueError(f"Missing positives at indices {bad[:8]}")
 
-        self.T5_encoder = T5EncoderModel.from_pretrained(self._prot_t5_name).to(self._device)
-        self.T5_tokenizer = T5Tokenizer.from_pretrained(self._prot_t5_name, do_lower_case=False)
-        # tm-vec expects tokenizer.batch_encode_plus in some versions
-        if not hasattr(self.T5_tokenizer, "batch_encode_plus"):
-            self.T5_tokenizer.batch_encode_plus = self.T5_tokenizer.__call__
+        nonpair_mask = valid_mask & (~pair_id.unsqueeze(0).eq(pair_id.unsqueeze(1)))
+        nonpair_counts = nonpair_mask.sum(dim=1)
+        if torch.any(nonpair_counts == 0):
+            bad = torch.nonzero(nonpair_counts == 0, as_tuple=False).view(-1).tolist()
+            raise ValueError(
+                f"Rows without negatives: {bad[:8]}. Increase per_device_train_batch_size to at least 4, "
+                "increase the number of mined pairs, or enable dataloader_drop_last to avoid one-pair final batches."
+            )
 
-        cfg = trans_basic_block_Config.from_json(self._tm_vec_model_config_json)
-        self.model_deep = trans_basic_block.load_from_checkpoint(self._tm_vec_model_ckpt, config=cfg).to(self._device)
+        masked_logits = logits.masked_fill(~valid_mask, float('-inf'))
+        log_denom = torch.logsumexp(masked_logits, dim=1, keepdim=True)
+        log_prob = logits - log_denom
+        positive_log_prob_sum = log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1)
+        mean_log_prob_pos = positive_log_prob_sum / positive_counts.to(log_prob.dtype)
+        loss = -mean_log_prob_pos.mean()
+        if not torch.isfinite(loss):
+            raise ValueError("TM-Vec/global-structure loss became non-finite")
+        return loss
 
-        if self._freeze:
-            self.T5_encoder.eval()
-            self.model_deep.eval()
+    def _teacher_distill_loss(self, student_repr: torch.Tensor, teacher_repr: Optional[torch.Tensor]) -> torch.Tensor:
+        if teacher_repr is None or self.distill_weight <= 0.0:
+            return student_repr.new_zeros(())
+        if teacher_repr.shape != student_repr.shape:
+            raise ValueError(
+                f"Teacher and student representation mismatch: "
+                f"{tuple(teacher_repr.shape)} vs {tuple(student_repr.shape)}"
+            )
+        s = F.normalize(student_repr.float(), dim=1)
+        t = F.normalize(teacher_repr.float().to(student_repr.device), dim=1)
+        s_sim = torch.matmul(s, s.transpose(0, 1))
+        t_sim = torch.matmul(t, t.transpose(0, 1))
+        mask = ~torch.eye(s_sim.shape[0], device=s_sim.device, dtype=torch.bool)
+        return F.mse_loss(s_sim[mask], t_sim[mask])
 
-        if self._use_half and str(self._device).startswith("cuda"):
-            self.T5_encoder.half()
-            self.model_deep.half()
-
-        self._online_ready = True
-
-    def __call__(self, model: "GLProtein", **kwargs):
-        # Use precomputed embeddings if possible
-        tmvec_emb = kwargs.pop("tmvec_emb", None)
-        if tmvec_emb is not None:
-            if not torch.is_tensor(tmvec_emb):
-                tmvec = torch.as_tensor(tmvec_emb, dtype=torch.float32, device=model.device if hasattr(model, "device") else None)
-            else:
-                tmvec = tmvec_emb
-            # Use float32 for stability
-            tmvec = tmvec.float()
-        else:
-            # Encode online from raw sequences
-            protein_sequence = kwargs.pop("sequence", None)
-            if protein_sequence is None:
-                raise ValueError("No protein_sequence")
-            self._ensure_online_encoder()
-            with torch.no_grad():
-                tmvec_np = encode(protein_sequence, self.model_deep, self.T5_encoder, self.T5_tokenizer, self._device)
-            tmvec = torch.as_tensor(tmvec_np, device=self._device, dtype=torch.float32)
-
-        batch_size = tmvec.shape[0]
-        if batch_size % 2 != 0:
-            raise ValueError("Batch size not even")
-
-        device = tmvec.device
-        y_true = torch.cat(
-            [
-                torch.arange(1, batch_size, step=2, dtype=torch.long, device=device).unsqueeze(1),
-                torch.arange(0, batch_size, step=2, dtype=torch.long, device=device).unsqueeze(1),
-            ],
-            dim=1,
-        ).reshape([batch_size])
-
-        norm_emb = F.normalize(tmvec, dim=1, p=2)
-        sim_score = torch.matmul(norm_emb, norm_emb.transpose(0, 1))
-        sim_score = sim_score - torch.eye(batch_size, device=device) * 1e12
-        sim_score = sim_score * self.temperature
-
-        return self.loss_func(sim_score, y_true)
-
+    def __call__(self, student_repr: torch.Tensor, pair_id: torch.Tensor, tmvec_emb: Optional[torch.Tensor] = None, **kwargs):
+        contrastive_loss = self._pairwise_contrastive_loss(student_repr=student_repr, pair_id=pair_id)
+        if tmvec_emb is not None and not torch.is_tensor(tmvec_emb):
+            tmvec_emb = torch.as_tensor(tmvec_emb, dtype=student_repr.dtype, device=student_repr.device)
+        distill_loss = self._teacher_distill_loss(student_repr=student_repr, teacher_repr=tmvec_emb)
+        return contrastive_loss + self.distill_weight * distill_loss

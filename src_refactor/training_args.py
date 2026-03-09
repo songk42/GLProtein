@@ -1,6 +1,7 @@
 from collections import defaultdict
 from json import decoder
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 from transformers import logging
@@ -154,8 +155,20 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Device for TM-Vec ('cuda' or 'cpu')."}
     )
     tmvec_temperature: float = field(
-        default=20.0,
-        metadata={"help": "Temperature for similarity logits in TMVecLoss."}
+        default=0.07,
+        metadata={"help": "Temperature for the global structure contrastive loss on GLProtein embeddings."}
+    )
+    tmvec_distill_weight: float = field(
+        default=0.0,
+        metadata={"help": "Optional weight for TM-Vec similarity distillation. Set 0 to disable."}
+    )
+    triplet_margin: float = field(
+        default=0.2,
+        metadata={"help": "Margin for the paper-style global structure triplet loss."}
+    )
+    triplet_distance_type: str = field(
+        default="l2",
+        metadata={"help": "Distance type for triplet loss: l2 or cosine."}
     )
     tmvec_freeze: bool = field(
         default=True,
@@ -165,6 +178,24 @@ class KMAETrainingArguments(TrainingArguments):
     tmvec_use_half: bool = field(
         default=False,
         metadata={"help": "Whether to use half precision for TM-Vec to save memory."}
+    )
+
+    triplet_microbatch_size: int = field(
+        default=0,
+        metadata={"help": "Optional microbatch size for sequential triplet encoding. 0 disables chunking."}
+    )
+    length_bucketed_batches: bool = field(
+        default=False,
+        metadata={"help": "Whether to bucket protein sequence batches by sequence length to reduce padding and VRAM spikes."}
+    )
+    length_bucket_size_multiplier: int = field(
+        default=20,
+        metadata={"help": "Pool size multiplier for length-bucketed batching. Larger values improve bucketing at the cost of more sorting."}
+    )
+
+    max_tokens_per_batch: int = field(
+        default=0,
+        metadata={"help": "Optional padded-token budget for protein sequence batches. 0 disables token-budget batching."}
     )
 
     # respectively set learning rate to training of protein language model and knowledge embedding
@@ -240,6 +271,31 @@ class KMAETrainingArguments(TrainingArguments):
         self.per_device_train_go_go_batch_size = self.per_device_train_batch_size
         self.per_device_train_protein_go_batch_size = self.per_device_train_batch_size
 
+        if self.use_tmvec_loss:
+            deprecated_tmvec_runtime_args = []
+            for name in ["tmvec_model_ckpt", "tmvec_model_config_json", "tmvec_prot_t5_name", "tmvec_device", "tmvec_freeze", "tmvec_use_half"]:
+                value = getattr(self, name)
+                default_value = type(self).__dataclass_fields__[name].default
+                if value != default_value and value is not None:
+                    deprecated_tmvec_runtime_args.append(f"{name}={value}")
+            if deprecated_tmvec_runtime_args:
+                warnings.warn(
+                    "TM-Vec runtime encoder arguments are now deprecated. TM-Vec is now offline-only during training. "
+                    f"These args will be ignored: {', '.join(deprecated_tmvec_runtime_args)}",
+                    UserWarning,
+                )
+            if self.tmvec_distill_weight < 0:
+                raise ValueError("tmvec_distill_weight must be >= 0")
+            if self.tmvec_weight < 0:
+                raise ValueError("tmvec_weight must be >= 0")
+
+        if self.triplet_microbatch_size < 0:
+            raise ValueError("triplet_microbatch_size must be >= 0")
+        if self.length_bucket_size_multiplier < 1:
+            raise ValueError("length_bucket_size_multiplier must be >= 1")
+        if self.max_tokens_per_batch < 0:
+            raise ValueError("max_tokens_per_batch must be >= 0")
+
         if self.deepspeed:
             # - must be run very last in arg parsing, since it will use a lot of these settings.
             # - must be run before the model is created.
@@ -276,6 +332,14 @@ class KMAETrainingArguments(TrainingArguments):
             self.warmup_steps if self.warmup_steps > 0 else math.ceil(num_training_steps * self.warmup_ratio)
         )
         return warmup_steps
+
+    @property
+    def global_structure_weight(self) -> float:
+        return self.tmvec_weight
+
+    @property
+    def global_structure_temperature(self) -> float:
+        return self.tmvec_temperature
 
     def get_lm_warmup_steps(self, num_training_steps: int):
         """
@@ -334,14 +398,19 @@ class DataArguments:
         metadata={"help": "Whether or not to save data into memory during sampling"}
     )
 
+    tmvec_triplets_tsv: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the explicit triplet TSV for global structure supervision."}
+    )
+
     tmvec_pairs_tsv: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to the sequence pair TSV for TMVecLoss."}
+        metadata={"help": "Deprecated pair TSV path. Still accepted for the older TMVecLoss path."}
     )
 
     tmvec_pairs_emb_npy: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to precomputed embeddings NPY for TMVecLoss"}
+        metadata={"help": "Deprecated pair-order teacher embedding NPY for TMVecLoss."}
     )
 
     protein_seq_sample_limit: Optional[int] = field(
