@@ -264,6 +264,11 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Whether or not to use adafactor optimizer."}
     )
 
+    save_steps: int = field(
+        default=0,
+        metadata={"help": "Save a checkpoint every N optimizer steps. 0 disables mid-training saves (a final checkpoint is always saved at the end)."}
+    )
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -416,6 +421,15 @@ class DataArguments:
     protein_seq_sample_limit: Optional[int] = field(
         default=None,
         metadata={"help": "Optional limit on number of protein sequence examples loaded."}
+    )
+
+    coordinates_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pickle file mapping protein index -> list of [x,y,z] alpha-C coordinates (from AlphaFoldDB)."}
+    )
+    aa_vec_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pretrained mol2vec Word2Vec model file (model_300dim.pkl) for amino acid substructure embeddings."}
     )
 
     # negative sampling

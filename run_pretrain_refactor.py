@@ -14,7 +14,8 @@ from src_refactor.dataloader import DataCollatorForGoGo, DataCollatorForLanguage
 from src_refactor.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
 
 logger = logging.get_logger(__name__)
-DEVICE = 'cpu'
+import torch
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def main():
@@ -98,7 +99,9 @@ def main():
                 data_dir=data_args.pretrain_data_dir,
                 tokenizer=protein_tokenizer,
                 max_protein_seq_length=data_args.max_protein_seq_length,
-                protein_seq_sample_limit=data_args.protein_seq_sample_limit
+                protein_seq_sample_limit=data_args.protein_seq_sample_limit,
+                coordinates_path=data_args.coordinates_path,
+                aa_vec_model_path=data_args.aa_vec_model_path,
             )
 
     # # whether to use protein function inference task during pretraining

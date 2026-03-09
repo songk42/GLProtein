@@ -40,14 +40,14 @@ def _collate_batch_for_protein_cor(
         tokenizer: PreTrainedTokenizerBase,
         are_protein_length_same: bool
 ):
-    if isinstance(examples[0], ProteinGoInputFeatures):
+    if isinstance(examples[0], (ProteinGoInputFeatures, ProteinSeqInputFeatures)):
         examples = [torch.tensor(e.coordinates, dtype=torch.float) for e in examples]
 
     if are_protein_length_same:
         return torch.stack(examples, dim=0)
 
     max_length = max(x.size(0) for x in examples)
-    result = np.full((len(examples),max_length, 3),float('-inf'))
+    result = np.full((len(examples),max_length, 3),float(0))
     for i, example in enumerate(examples):
         if tokenizer.padding_side == 'right':
             result[i][:example.size(0)] = example
@@ -66,7 +66,7 @@ def _collate_batch_for_aa_vec(
         tokenizer: PreTrainedTokenizerBase,
         are_protein_length_same: bool
 ):
-    if isinstance(examples[0], ProteinGoInputFeatures):
+    if isinstance(examples[0], (ProteinGoInputFeatures, ProteinSeqInputFeatures)):
         examples = [torch.tensor(np.array(e.aa_vec), dtype=torch.float) for e in examples]
 
 
@@ -592,6 +592,12 @@ class DataCollatorForLanguageModeling:
             batch['tmvec_emb'] = torch.tensor([e.tmvec_emb for e in examples], dtype=torch.float32)
             if 'pair_id' in batch and batch['tmvec_emb'].shape[0] != batch['pair_id'].shape[0]:
                 raise ValueError("tmvec_emb batch dimension must match pair_id batch dimension")
+        # Collect 3D coordinates and aa_vec (mol2vec) for local structure encoding (Section 3.3).
+        # These are aligned with the protein sequence (one entry per residue, excluding CLS/SEP).
+        if hasattr(examples[0], 'coordinates') and examples[0].coordinates is not None:
+            batch['coordinates'] = _collate_batch_for_protein_cor(examples, self.tokenizer, self.are_protein_length_same)
+        if hasattr(examples[0], 'aa_vec') and examples[0].aa_vec is not None:
+            batch['aa_vec'] = _collate_batch_for_aa_vec(examples, self.tokenizer, self.are_protein_length_same)
 
         special_tokens_mask = batch.pop('special_tokens_mask', None)
         if self.mlm:
@@ -605,10 +611,10 @@ class DataCollatorForLanguageModeling:
             batch['labels'] = labels
 
         batch['attention_mask'] = (batch['input_ids'] != self.tokenizer.pad_token_id).long()
-        # batch['coordinate_attention_mask'] = batch['attention_mask']
-        # batch['aa_vec_attention_mask'] = batch['attention_mask']
         batch['token_type_ids'] = torch.zeros_like(batch['input_ids'], dtype=torch.long)
 
+        if 'aa_vec' in batch:
+            batch['aa_vec_attention_mask'] = batch['attention_mask']
 
         return batch
 

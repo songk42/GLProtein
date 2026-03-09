@@ -428,56 +428,58 @@ class NonLinear(nn.Module):
         x = self.layer2(x)
         return x
 
-# class Protein3DBias(nn.Module):
-#     """
-#         Compute 3D attention bias according to the position information for each head.
-#         """
+class Protein3DBias(nn.Module):
+    """
+    Compute Phi_distance: the 3D distance attention bias (Section 3.3).
+    Projects pairwise alpha-C distances through Gaussian Basis Kernels to
+    produce a per-head attention bias of shape [batch, num_heads, L, L].
+    num_heads must match the decoder's num_attention_heads.
+    """
 
-#     def __init__(self):
-#         super(Protein3DBias, self).__init__()
-#         self.num_heads = 8
-#         self.num_edges = 2
-#         self.num_kernel = 128
-#         self.embed_dim = 512
+    def __init__(self, num_heads=16):
+        super(Protein3DBias, self).__init__()
+        self.num_heads = num_heads
+        self.num_edges = 2
+        self.num_kernel = 128
+        self.embed_dim = 512
 
+        self.gbf = GaussianLayer(self.num_kernel, self.num_edges)
+        self.gbf_proj = NonLinear(self.num_kernel, num_heads)
 
-#         rpe_heads = self.num_heads
-#         self.gbf = GaussianLayer(self.num_kernel, self.num_edges)
-#         self.gbf_proj = NonLinear(self.num_kernel, rpe_heads)
+        if self.num_kernel != self.embed_dim:
+            self.edge_proj = nn.Linear(self.num_kernel, self.embed_dim)
+        else:
+            self.edge_proj = None
 
-#         if self.num_kernel != self.embed_dim:
-#             self.edge_proj = nn.Linear(self.num_kernel, self.embed_dim)
-#         else:
-#             self.edge_proj = None
+    def forward(self, batched_data):
+        # pos: [batch, n_nodes, 3], x used only for padding mask
+        pos, x, node_type_edge = (
+            batched_data['protein_coordinates'],
+            batched_data['protein_input_ids'],
+            batched_data['protein_token_type_ids'],
+        )
+        padding_mask = x.eq(0).all(dim=-1)
+        n_graph, n_node, _ = pos.shape
+        delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
+        # Use eps inside sqrt to avoid NaN gradients when delta_pos=0 (diagonal)
+        dist = (delta_pos.pow(2).sum(dim=-1) + 1e-8).sqrt().view(-1, n_node, n_node)
+        delta_pos /= dist.unsqueeze(-1) + 1e-5
 
-#     def forward(self, batched_data):
+        edge_feature = self.gbf(
+            dist,
+            torch.ones_like(dist, dtype=torch.long).unsqueeze(-1),  # [batch, n_node, n_node, 1]; type 1 = valid edge
+        )
+        gbf_result = self.gbf_proj(edge_feature)
+        graph_attn_bias = gbf_result.permute(0, 3, 1, 2).contiguous()  # [batch, num_heads, L, L]
+        graph_attn_bias.masked_fill_(padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
-#         pos, x, node_type_edge = batched_data['protein_coordinates'], batched_data['protein_input_ids'], batched_data['protein_token_type_ids'] # pos shape: [n_examoles, n_nodes, 3]
-#         # pos.requires_grad_(True)
+        edge_feature = edge_feature.masked_fill(
+            padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool), 0.0
+        )
+        sum_edge_features = edge_feature.sum(dim=-2)
+        merge_edge_features = self.edge_proj(sum_edge_features)
 
-#         padding_mask = x.eq(0).all(dim=-1)
-#         n_graph, n_node, _ = pos.shape
-#         delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
-#         dist = delta_pos.norm(dim=-1).view(-1, n_node, n_node)
-#         delta_pos /= dist.unsqueeze(-1) + 1e-5
-
-#         edge_feature = self.gbf(dist, torch.zeros_like(dist).long() if node_type_edge is None else node_type_edge.long())
-#         gbf_result = self.gbf_proj(edge_feature)
-#         graph_attn_bias = gbf_result
-
-#         graph_attn_bias = graph_attn_bias.permute(0, 3, 1, 2).contiguous()
-#         graph_attn_bias.masked_fill_(
-#             padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
-#         )
-
-#         edge_feature = edge_feature.masked_fill(
-#             padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool), 0.0
-#         )
-
-#         sum_edge_features = edge_feature.sum(dim=-2)
-#         merge_edge_features = self.edge_proj(sum_edge_features)
-
-#         return graph_attn_bias, merge_edge_features, delta_pos
+        return graph_attn_bias, merge_edge_features, delta_pos
 
 
 
@@ -628,11 +630,8 @@ class KnowledgeDecoder(BertPreTrainedModel):
         self.go_project = nn.Linear(textbert_config.hidden_size, self.config.hidden_size)
         self.relation_project = nn.Linear(textbert_config.hidden_size, self.config.hidden_size)
         
-        self.coordinate_project = nn.Linear(3, self.config.hidden_size)
         self.aa_vec_project = nn.Linear(300, self.config.hidden_size)
-
-        self.gbf = GaussianLayer(128, 1)
-        self.gbf_proj = NonLinear(128, 512, 1024)
+        self.protein3d_bias = Protein3DBias(self.config.num_attention_heads)
 
         self.text_feat_dim = textbert_config.hidden_size
         self.text_pooler = BertPooler(textbert_config)
@@ -665,89 +664,45 @@ class KnowledgeDecoder(BertPreTrainedModel):
         return_mlm=True,
         coordinate_inputs=None,
         aa_vec_inputs = None):
-        batch, protein_len, protein_embed_size = inputs_embeds.size()
+        ### local structure encoding (Section 3.3)
+        coordinate_input = coordinate_inputs  # [batch, n_node, 3]
+        aa_vec_input, aa_vec_attention_mask = aa_vec_inputs
 
-        ### coordinate feature extraction
+        # Compute Phi_distance: graph_attn_bias [batch, num_heads, n_node, n_node]
+        batched_data = {
+            'protein_coordinates': coordinate_input,
+            'protein_input_ids': coordinate_input,   # all-zero rows → padding mask
+            'protein_token_type_ids': None,
+        }
+        graph_attn_bias, _, _ = self.protein3d_bias(batched_data)
+        # pad for [CLS] and [SEP] tokens added by the tokenizer
+        graph_attn_bias = F.pad(graph_attn_bias, (1, 1, 1, 1), value=0.0)
 
+        # project aa_vec from 300-dim mol2vec to decoder hidden_size
+        aa_vec_feat = self.aa_vec_project(aa_vec_input)  # [batch, n_node, hidden_size]
 
-        # coordinate_input,coordinate_attention_mask = coordinate_inputs 
-        # aa_vec_input,aa_vec_attention_mask = aa_vec_inputs
+        # aa_vec has n_node entries (residues only, no CLS/SEP), but the protein sequence in the
+        # decoder has n_node+2 tokens (CLS + residues + SEP).  Pad aa_vec with zero vectors at
+        # position 0 and -1 so cross-attention scores [batch, heads, n_node+2, n_node+2] align
+        # with graph_attn_bias [batch, heads, n_node+2, n_node+2].
+        # aa_vec_attention_mask is already length n_node+2 (it reuses the protein attention_mask).
+        cls_sep_feat = torch.zeros(aa_vec_feat.size(0), 1, aa_vec_feat.size(-1),
+                                   device=aa_vec_feat.device, dtype=aa_vec_feat.dtype)
+        aa_vec_feat = torch.cat([cls_sep_feat, aa_vec_feat, cls_sep_feat], dim=1)  # [batch, n_node+2, hidden_size]
 
-
-        # #get the coordinate mask
-        # coordinate_attention_mask = torch.mean(coordinate_input,dim=2)
-        # coordinate_attention_mask = torch.where(torch.isinf(coordinate_attention_mask),torch.zeros_like(coordinate_attention_mask),coordinate_attention_mask)
-        # coordinate_attention_mask = torch.where(torch.isnan(coordinate_attention_mask),torch.zeros_like(coordinate_attention_mask),coordinate_attention_mask)
-        # coordinate_attention_mask = coordinate_attention_mask.bool()
-
-        # delta_pos = coordinate_input.unsqueeze(1) - coordinate_input.unsqueeze(2)
-        # dist = delta_pos.norm(dim=-1).view(-1, protein_len-2, protein_len-2)
-        # delta_pos /= dist.unsqueeze(-1) + 1e-5
-        
-        # delta_pos = torch.where(torch.isinf(delta_pos),torch.zeros_like(delta_pos),delta_pos)
-        # delta_pos = torch.where(torch.isnan(delta_pos),torch.zeros_like(delta_pos),delta_pos)
-        # delta_pos = torch.mean(delta_pos,dim=2)
-        # coordinate_feat = self.coordinate_project(delta_pos) #(batch,coordinate len, decoder hidden dim)
-        
-        
-        # aa_vec_attention_mask = coordinate_attention_mask
-
-
-        # aa_vec_feat = self.aa_vec_project(aa_vec_input) #(batch,aa_vec len, decoder hidden dim)
-
-        
-        # go_input_ids, go_attention_mask, go_token_type_ids = go_inputs
-        
-
-        # go_out = self.textbert(go_input_ids,
-        #                             attention_mask=go_attention_mask,
-        #                             token_type_ids=go_token_type_ids,
-        #                             output_hidden_states=True,
-        #                             return_dict=True) # (batch,token len, feat_dim)  
-
-        # # hidden size (b,seqlen, 768)
-        # go_feat = torch.cat(tuple([go_out.hidden_states[i].unsqueeze(1) for i in [-4, -3, -2, -1]]), dim=1) # (b ,4, go len, hidden_dim)
-        # go_feat = torch.mean(go_feat,dim=1) # (b,go len, hidden_dim)
-
-        # go_feat = self.go_project(go_feat) #(batch,, go len, decoder hidden dim)
-
-
-        # ### relation feature extraction
-        # relation_input_ids, relation_attention_mask, relation_token_type_ids = relation_inputs
-        # relation_out = self.textbert(relation_input_ids,
-        #                             attention_mask=relation_attention_mask,
-        #                             token_type_ids=relation_token_type_ids,
-        #                             output_hidden_states=True,
-        #                             return_dict=True) # (batch,token len, feat_dim)
-
-
-        # relation_feat = torch.cat(tuple([relation_out.hidden_states[i].unsqueeze(1) for i in [-4, -3, -2, -1]]), dim=1) # (b ,4,relation len, hidden_dim)
-
-        # relation_feat = torch.mean(relation_feat,dim=1) # (b,relation len, hidden_dim)
-
-        # relation_feat = self.relation_project(relation_feat) #(batch,relation len, decoder hidden dim)'
-        
-
-
-        #HACK
-        ## input embedding to decoder, mask stay the same as protbert
-        out = self.decoder(inputs_embeds=inputs_embeds,
+        out = self.decoder(
+            inputs_embeds=inputs_embeds,
             input_ids=None,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
-            # relation_hidden_states=relation_feat,
-            # relation_attention_mask=relation_attention_mask,
-            # go_hidden_states=go_feat,
-            # go_attention_mask=go_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            # coordinate_hidden_states= coordinate_feat,
-            # coordinate_attention_mask= coordinate_attention_mask,
-            # aa_vec_hidden_states = aa_vec_feat,
-            # aa_vec_attention_mask = aa_vec_attention_mask,
+            aa_vec_hidden_states=aa_vec_feat,
+            aa_vec_attention_mask=aa_vec_attention_mask,
+            graph_attn_bias=graph_attn_bias,
         )
 
 
@@ -800,24 +755,23 @@ class GLProtein(nn.Module):
 
       
 
-        # protein_input_ids, protein_attention_mask, protein_token_type_ids, protein_coordinates,coordinate_attention_mask, aa_vec, aa_vec_attention_mask= protein_inputs
         protein_input_ids = protein_inputs["input_ids"]
         protein_attention_mask = protein_inputs["attention_mask"]
         protein_token_type_ids = protein_inputs["token_type_ids"]
 
-        # coordinate_inputs = (protein_coordinates,coordinate_attention_mask)
-        # aa_vec_inputs = (aa_vec,aa_vec_attention_mask)
+        batch_size, seq_len = protein_input_ids.shape
+        n_node = seq_len - 2  # exclude CLS/SEP tokens
+        device = protein_input_ids.device
 
-       
+        protein_coordinates = protein_inputs.get(
+            "coordinates", torch.zeros(batch_size, n_node, 3, device=device))
+        aa_vec = protein_inputs.get(
+            "aa_vec", torch.zeros(batch_size, n_node, 300, device=device))
+        aa_vec_attention_mask = protein_inputs.get(
+            "aa_vec_attention_mask", protein_attention_mask)
 
-        # protein_outputs = self.encoder(
-        #     input_ids=protein_input_ids,
-        #     attention_mask=protein_attention_mask,
-        #     token_type_ids=protein_token_type_ids,
-        #     output_hidden_states=True,
-        #     return_dict=True,
-        #     output_attentions=output_attentions
-        # )
+        coordinate_inputs = protein_coordinates
+        aa_vec_inputs = (aa_vec, aa_vec_attention_mask)
 
         protein_outputs = self.encoder(
             input_ids=protein_input_ids,
@@ -828,41 +782,20 @@ class GLProtein(nn.Module):
             output_attentions=output_attentions
         )
 
+        prot_seq_embed = protein_outputs[0]
 
-        prot_seq_embed = protein_outputs[0] 
-
-
-        out, mlm_prediction_scores, pos_pfi_prediction = self.decoder(inputs_embeds=prot_seq_embed,
+        out, mlm_prediction_scores, pos_pfi_prediction = self.decoder(
+            inputs_embeds=prot_seq_embed,
             attention_mask=protein_attention_mask,
             token_type_ids=protein_token_type_ids,
             output_attentions=output_attentions,
             output_hidden_states=True,
             return_dict=True,
+            coordinate_inputs=coordinate_inputs,
+            aa_vec_inputs=aa_vec_inputs,
         )
 
-        
-        # out, mlm_prediction_scores, pos_pfi_prediction = self.decoder(pos_relation_inputs, pos_go_tail_inputs,inputs_embeds=prot_seq_embed,
-        #     attention_mask=protein_attention_mask,
-        #     token_type_ids=protein_token_type_ids,
-        #     output_hidden_states=True,
-        #     return_dict=True,
-        #     output_attentions=output_attentions,
-        #     coordinate_inputs = coordinate_inputs,
-        #     input_ids = protein_input_ids,
-        #     aa_vec_inputs = aa_vec_inputs,
-        #     )
-
-        neg_pfi_prediction=None
-        if use_pfi:
-            out_neg, neg_mlm_prediction_scores, neg_pfi_prediction = self.decoder(neg_relation_inputs, neg_go_tail_inputs,inputs_embeds=prot_seq_embed,
-            attention_mask=protein_attention_mask,
-            token_type_ids=protein_token_type_ids,
-            output_hidden_states=True,
-            return_dict=True,
-            output_attentions=output_attentions,
-            coordinate_inputs = coordinate_inputs,
-            input_ids = protein_input_ids
-            )
+        neg_pfi_prediction = None
 
 
         return MaskedLMAndPFIOutput(

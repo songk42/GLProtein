@@ -532,7 +532,7 @@ class GLProteinTrainer(Trainer):
 
             self.state.global_step += 1
 
-            if (step+1) % 10000 == 0:
+            if args.save_steps > 0 and (step + 1) % args.save_steps == 0:
                 self._save_checkpoint()
 
             # print("forward propagation time",time.time()-tempt)

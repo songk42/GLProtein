@@ -66,6 +66,8 @@ sh ./script/run_pretrain.sh
 ```
 The detailed arguments are listed in `src/training_args.py`. 
 
+- [Mol2Vec checkpoint](https://github.com/samoturk/mol2vec/blob/master/examples/models/model_300dim.pkl)
+
 ----
 ## Downstream Tasks (Fine-tuning)
 
