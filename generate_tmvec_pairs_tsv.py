@@ -12,7 +12,6 @@ import tarfile
 import tempfile
 import time
 from collections import OrderedDict
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -362,6 +361,221 @@ import shutil
 logger = logging.getLogger(__name__)
 
 
+
+def load_checkpoint(path: str) -> Optional[Dict]:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def save_checkpoint(path: str, state: Dict) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def build_checkpoint_state(args, *, next_anchor_index: int, rows: int, skipped: int, anchors_processed: int, anchors_with_triplets: int, missing_exact_positive: int, missing_exact_negative: int, positive_scores_logged: List[float], negative_scores_logged: List[float], positive_score_mode: str, negative_score_mode: str, faiss_enabled: bool, num_sequences: int, embedding_dim: int, start_time: float) -> Dict:
+    elapsed = max(time.time() - start_time, 0.0)
+    return {
+        'version': 3,
+        'out_tsv': os.path.abspath(args.out_tsv),
+        'swiss_fasta': os.path.abspath(args.swiss_fasta),
+        'swiss_tmvec_emb_npy': os.path.abspath(args.swiss_tmvec_emb_npy),
+        'max_proteins': args.max_proteins,
+        'max_protein_seq_length': args.max_protein_seq_length,
+        'top_k_pos': args.top_k_pos,
+        'triplets_per_anchor': args.triplets_per_anchor,
+        'positive_search_k': args.positive_search_k,
+        'positive_tmscore_min': args.positive_tmscore_min,
+        'neg_random_pool': args.neg_random_pool,
+        'negative_tmscore_max': args.negative_tmscore_max,
+        'negative_pick_strategy': args.negative_pick_strategy,
+        'exact_tm_score_structures_dir': os.path.abspath(args.exact_tm_score_structures_dir) if args.exact_tm_score_structures_dir else None,
+        'tm_score_impl': args.tm_score_impl if args.exact_tm_score_structures_dir else None,
+        'tm_score_norm': args.tm_score_norm if args.exact_tm_score_structures_dir else None,
+        'next_anchor_index': int(next_anchor_index),
+        'rows_written': int(rows),
+        'skipped_anchors': int(skipped),
+        'anchors_processed': int(anchors_processed),
+        'anchors_with_triplets': int(anchors_with_triplets),
+        'missing_exact_positive_scores': int(missing_exact_positive),
+        'missing_exact_negative_scores': int(missing_exact_negative),
+        'positive_scores_logged_tail': positive_scores_logged[-1000:],
+        'negative_scores_logged_tail': negative_scores_logged[-1000:],
+        'positive_score_mode': positive_score_mode,
+        'negative_score_mode': negative_score_mode,
+        'use_faiss': bool(faiss_enabled),
+        'num_sequences': int(num_sequences),
+        'embedding_dim': int(embedding_dim),
+        'elapsed_seconds_before_resume': float(elapsed),
+    }
+
+
+def maybe_save_checkpoint(path: str, every_anchors: int, processed_anchor_count: int, state: Dict, tsv_handle=None) -> None:
+    if every_anchors and every_anchors > 0 and processed_anchor_count > 0 and processed_anchor_count % every_anchors == 0:
+        if tsv_handle is not None:
+            flush_tsv_file(tsv_handle)
+        save_checkpoint(path, state)
+
+
+def count_tsv_data_rows(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+    with open(path, 'r', encoding='utf-8', newline='') as f:
+        total = sum(1 for _ in f)
+    return max(total - 1, 0)
+
+
+def flush_tsv_file(handle) -> None:
+    if handle is None or handle.closed:
+        return
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def truncate_tsv_data_rows(path: str, keep_data_rows: int) -> None:
+    tmp_path = f"{path}.truncate.tmp"
+    with open(path, 'r', encoding='utf-8', newline='') as src, open(tmp_path, 'w', encoding='utf-8', newline='') as dst:
+        for lineno, line in enumerate(src):
+            if lineno == 0:
+                dst.write(line)
+                continue
+            if lineno <= keep_data_rows:
+                dst.write(line)
+            else:
+                break
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.replace(tmp_path, path)
+
+
+def recover_resume_state_from_tsv(path: str, ids: List[str]) -> Dict[str, object]:
+    if not os.path.exists(path):
+        return {
+            'resume_anchor_index': 0,
+            'rows_written': 0,
+            'anchors_processed': 0,
+            'anchors_with_triplets': 0,
+            'skipped_anchors': 0,
+            'positive_scores_logged_tail': [],
+            'negative_scores_logged_tail': [],
+            'recovered_by_truncating_last_anchor': False,
+        }
+
+    id_to_index: Dict[str, int] = {}
+    for idx, seq_id in enumerate(ids):
+        if seq_id not in id_to_index:
+            id_to_index[seq_id] = idx
+
+    with open(path, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f, delimiter='	')
+        header = next(reader, None)
+        if header is None:
+            return {
+                'resume_anchor_index': 0,
+                'rows_written': 0,
+                'anchors_processed': 0,
+                'anchors_with_triplets': 0,
+                'skipped_anchors': 0,
+                'positive_scores_logged_tail': [],
+                'negative_scores_logged_tail': [],
+                'recovered_by_truncating_last_anchor': False,
+            }
+        try:
+            anchor_idx = header.index('anchor_id')
+            pos_idx = header.index('positive_score')
+            neg_idx = header.index('negative_score')
+        except ValueError as exc:
+            raise ValueError(f'Existing TSV is missing required columns: {exc}')
+
+        data_rows = 0
+        group_count = 0
+        last_group_anchor_id: Optional[str] = None
+        last_group_start_row = 1
+        prev_anchor_id: Optional[str] = None
+
+        for data_rows, row in enumerate(reader, start=1):
+            aid = row[anchor_idx]
+            if prev_anchor_id is None or aid != prev_anchor_id:
+                group_count += 1
+                last_group_anchor_id = aid
+                last_group_start_row = data_rows
+                prev_anchor_id = aid
+
+    if data_rows == 0 or last_group_anchor_id is None:
+        return {
+            'resume_anchor_index': 0,
+            'rows_written': 0,
+            'anchors_processed': 0,
+            'anchors_with_triplets': 0,
+            'skipped_anchors': 0,
+            'positive_scores_logged_tail': [],
+            'negative_scores_logged_tail': [],
+            'recovered_by_truncating_last_anchor': False,
+        }
+
+    if last_group_anchor_id not in id_to_index:
+        raise ValueError(f'Last TSV anchor_id {last_group_anchor_id} is not present in the current FASTA')
+
+    keep_rows = last_group_start_row - 1
+    resume_anchor_index = id_to_index[last_group_anchor_id]
+
+    pos_tail: List[float] = []
+    neg_tail: List[float] = []
+    if keep_rows > 0:
+        with open(path, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f, delimiter='	')
+            next(reader, None)
+            for rowno, row in enumerate(reader, start=1):
+                if rowno > keep_rows:
+                    break
+                try:
+                    pos_tail.append(float(row[pos_idx]))
+                    neg_tail.append(float(row[neg_idx]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+        pos_tail = pos_tail[-1000:]
+        neg_tail = neg_tail[-1000:]
+
+    anchors_with_triplets = max(group_count - 1, 0)
+    anchors_processed = resume_anchor_index
+    skipped_anchors = max(anchors_processed - anchors_with_triplets, 0)
+
+    return {
+        'resume_anchor_index': int(resume_anchor_index),
+        'rows_written': int(keep_rows),
+        'anchors_processed': int(anchors_processed),
+        'anchors_with_triplets': int(anchors_with_triplets),
+        'skipped_anchors': int(skipped_anchors),
+        'positive_scores_logged_tail': pos_tail,
+        'negative_scores_logged_tail': neg_tail,
+        'recovered_by_truncating_last_anchor': True,
+    }
+
+
+def validate_resume_args(checkpoint_state: Dict, args) -> None:
+    expected = {
+        'max_proteins': args.max_proteins,
+        'max_protein_seq_length': args.max_protein_seq_length,
+        'top_k_pos': args.top_k_pos,
+        'triplets_per_anchor': args.triplets_per_anchor,
+        'positive_search_k': args.positive_search_k,
+        'positive_tmscore_min': args.positive_tmscore_min,
+        'neg_random_pool': args.neg_random_pool,
+        'negative_tmscore_max': args.negative_tmscore_max,
+        'negative_pick_strategy': args.negative_pick_strategy,
+        'use_faiss': bool(args.use_faiss),
+        'exact_tm_score_structures_dir': os.path.abspath(args.exact_tm_score_structures_dir) if args.exact_tm_score_structures_dir else None,
+        'tm_score_impl': args.tm_score_impl if args.exact_tm_score_structures_dir else None,
+        'tm_score_norm': args.tm_score_norm if args.exact_tm_score_structures_dir else None,
+    }
+    for key, value in expected.items():
+        if checkpoint_state.get(key) != value:
+            raise ValueError(f'Checkpoint {key} mismatch: {checkpoint_state.get(key)} vs {value}')
+
+
 def summarize(values: List[float]) -> Dict[str, float]:
     if not values:
         return {}
@@ -400,6 +614,9 @@ def main():
     ap.add_argument('--tm_score_impl', choices=['tmtools', 'usalign'], default='tmtools', help='Exact TM-score backend used when --exact_tm_score_structures_dir is provided.')
     ap.add_argument('--tm_score_norm', choices=['chain1', 'chain2', 'avg', 'max', 'min'], default='chain1', help='How to choose the normalized TM-score when the backend reports both directions.')
     ap.add_argument('--log_every_anchors', type=int, default=1000, help='Print progress every N processed anchors. 0 disables periodic progress logging.')
+    ap.add_argument('--checkpoint_path', default=None, help='Path to resumable mining checkpoint JSON. Defaults to <out_tsv>.checkpoint.json.')
+    ap.add_argument('--checkpoint_every_anchors', type=int, default=1000, help='Save a resumable checkpoint every N processed anchors. 0 disables checkpoint saves.')
+    ap.add_argument('--resume', action='store_true', help='Resume from checkpoint_path if it exists and append to an existing TSV.')
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -444,6 +661,7 @@ def main():
 
     out_path = args.out_tsv
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    checkpoint_path = args.checkpoint_path or (out_path + '.checkpoint.json')
 
     logger.info(
         'Triplet mining config | num_sequences=%d | embedding_dim=%d | out_tsv=%s | top_k_pos=%d | triplets_per_anchor=%d | positive_search_k=%d | positive_tmscore_min=%.3f | neg_random_pool=%d | negative_tmscore_max=%.3f | negative_pick_strategy=%s | use_faiss=%s | exact_tm_score=%s | tm_score_impl=%s | tm_score_norm=%s | max_protein_seq_length=%s | max_proteins=%s',
@@ -464,6 +682,7 @@ def main():
         args.max_protein_seq_length,
         args.max_proteins,
     )
+    logger.info('Checkpoint config | checkpoint_path=%s | checkpoint_every_anchors=%s | resume=%s', checkpoint_path, args.checkpoint_every_anchors, args.resume)
 
     rows = 0
     skipped = 0
@@ -475,7 +694,68 @@ def main():
     negative_score_mode = 'predicted_tmvec_tmscore'
     anchors_processed = 0
     anchors_with_triplets = 0
-    start_time = time.time()
+    resume_elapsed_seconds = 0.0
+    resume_anchor_index = 0
+
+    if args.resume:
+        checkpoint_state = load_checkpoint(checkpoint_path)
+        if checkpoint_state is not None:
+            if os.path.abspath(out_path) != checkpoint_state.get('out_tsv'):
+                raise ValueError(f'Checkpoint out_tsv mismatch: {checkpoint_state.get("out_tsv")} vs {os.path.abspath(out_path)}')
+            if os.path.abspath(args.swiss_fasta) != checkpoint_state.get('swiss_fasta'):
+                raise ValueError('Checkpoint swiss_fasta mismatch')
+            if os.path.abspath(args.swiss_tmvec_emb_npy) != checkpoint_state.get('swiss_tmvec_emb_npy'):
+                raise ValueError('Checkpoint swiss_tmvec_emb_npy mismatch')
+            validate_resume_args(checkpoint_state, args)
+            if not os.path.exists(out_path):
+                raise FileNotFoundError(f'Checkpoint exists but TSV does not: {out_path}')
+            resume_anchor_index = int(checkpoint_state.get('next_anchor_index', 0))
+            rows = int(checkpoint_state.get('rows_written', 0))
+            skipped = int(checkpoint_state.get('skipped_anchors', 0))
+            anchors_processed = int(checkpoint_state.get('anchors_processed', 0))
+            anchors_with_triplets = int(checkpoint_state.get('anchors_with_triplets', 0))
+            missing_exact_positive = int(checkpoint_state.get('missing_exact_positive_scores', 0))
+            missing_exact_negative = int(checkpoint_state.get('missing_exact_negative_scores', 0))
+            positive_scores_logged = list(checkpoint_state.get('positive_scores_logged_tail', []))
+            negative_scores_logged = list(checkpoint_state.get('negative_scores_logged_tail', []))
+            positive_score_mode = checkpoint_state.get('positive_score_mode', positive_score_mode)
+            negative_score_mode = checkpoint_state.get('negative_score_mode', negative_score_mode)
+            resume_elapsed_seconds = float(checkpoint_state.get('elapsed_seconds_before_resume', 0.0))
+            if resume_anchor_index < 0:
+                raise ValueError(f'Invalid resume_anchor_index in checkpoint: {resume_anchor_index}')
+            if resume_anchor_index > n:
+                raise ValueError(f'Checkpoint next_anchor_index {resume_anchor_index} exceeds current sequence count {n}')
+            existing_rows = count_tsv_data_rows(out_path)
+            if existing_rows > rows:
+                logger.warning('Resume TSV/checkpoint data row mismatch: %d vs %d. Truncating TSV and resuming from checkpoint anchor %d.', existing_rows, rows, resume_anchor_index)
+                truncate_tsv_data_rows(out_path, rows)
+                existing_rows = rows
+            elif existing_rows < rows:
+                logger.warning('Resume TSV/checkpoint row mismatch: %d vs %d. Recovering from the TSV itself and truncating the last anchor block.', existing_rows, rows)
+                recovered = recover_resume_state_from_tsv(out_path, ids)
+                recovered_rows = int(recovered['rows_written'])
+                truncate_tsv_data_rows(out_path, recovered_rows)
+                resume_anchor_index = int(recovered['resume_anchor_index'])
+                rows = recovered_rows
+                anchors_processed = int(recovered['anchors_processed'])
+                anchors_with_triplets = int(recovered['anchors_with_triplets'])
+                skipped = int(recovered['skipped_anchors'])
+                positive_scores_logged = list(recovered['positive_scores_logged_tail'])
+                negative_scores_logged = list(recovered['negative_scores_logged_tail'])
+                missing_exact_positive = 0
+                missing_exact_negative = 0
+                positive_score_mode = 'predicted_tmvec_tmscore'
+                negative_score_mode = 'predicted_tmvec_tmscore'
+                existing_rows = recovered_rows
+                logger.warning('Recovered resume state from TSV | resume_anchor_index=%d | rows_written=%d | anchors_processed=%d | anchors_with_triplets=%d | skipped=%d', resume_anchor_index, rows, anchors_processed, anchors_with_triplets, skipped)
+            if resume_anchor_index == n:
+                logger.info('Checkpoint indicates completion (next_anchor_index=%d, num_sequences=%d).', resume_anchor_index, n)
+                return
+            logger.info('Resuming triplet mining from checkpoint | checkpoint_path=%s | next_anchor_index=%d | rows_written=%d | anchors_processed=%d', checkpoint_path, resume_anchor_index, rows, anchors_processed)
+        else:
+            logger.info('Resume requested but no checkpoint found at %s; starting fresh.', checkpoint_path)
+
+    start_time = time.time() - resume_elapsed_seconds
 
     def _log_progress(force: bool = False):
         if not force and (args.log_every_anchors is None or args.log_every_anchors <= 0):
@@ -485,28 +765,32 @@ def main():
         elapsed = max(time.time() - start_time, 1e-9)
         anchors_per_sec = anchors_processed / elapsed
         rows_per_sec = rows / elapsed if rows > 0 else 0.0
-        pct = (anchors_processed / n * 100.0) if n > 0 else 100.0
-        remaining = max(n - anchors_processed, 0)
+        total_processed = min(max(anchors_processed, 0), n)
+        pct = (total_processed / n * 100.0) if n > 0 else 100.0
+        remaining = max(n - total_processed, 0)
         eta_seconds = remaining / anchors_per_sec if anchors_per_sec > 0 else float('inf')
         pos_summary = summarize(positive_scores_logged[-1000:])
         neg_summary = summarize(negative_scores_logged[-1000:])
         logger.info(
             'Triplet mining progress | anchors=%d/%d (%.2f%%) | rows_written=%d | anchors_with_triplets=%d | skipped=%d | missing_exact_pos=%d | missing_exact_neg=%d | elapsed=%.1fs | anchors_per_sec=%.2f | rows_per_sec=%.2f | eta_seconds=%s | pos_mean=%s | neg_mean=%s',
-            anchors_processed, n, pct, rows, anchors_with_triplets, skipped, missing_exact_positive, missing_exact_negative, elapsed, anchors_per_sec, rows_per_sec,
+            min(max(anchors_processed, 0), n), n, pct, rows, anchors_with_triplets, skipped, missing_exact_positive, missing_exact_negative, elapsed, anchors_per_sec, rows_per_sec,
             'inf' if eta_seconds == float('inf') else f'{eta_seconds:.1f}',
             None if not pos_summary else f"{pos_summary['mean']:.4f}",
             None if not neg_summary else f"{neg_summary['mean']:.4f}",
         )
 
-    with open(out_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow([
-            'anchor_id', 'positive_id', 'negative_id',
-            'anchor_seq', 'positive_seq', 'negative_seq',
-            'positive_score', 'negative_score'
-        ])
+    file_mode = 'a' if args.resume and resume_anchor_index > 0 and os.path.exists(out_path) else 'w'
+    logger.info('Triplet mining start mode | file_mode=%s | resume_anchor_index=%d | num_sequences=%d | max_proteins=%s', file_mode, resume_anchor_index, n, args.max_proteins)
+    with open(out_path, file_mode, encoding='utf-8', newline='') as f:
+        writer = csv.writer(f, delimiter='	')
+        if file_mode == 'w':
+            writer.writerow([
+                'anchor_id', 'positive_id', 'negative_id',
+                'anchor_seq', 'positive_seq', 'negative_seq',
+                'positive_score', 'negative_score'
+            ])
 
-        for i in range(n):
+        for i in range(resume_anchor_index, n):
             anchors_processed += 1
             if faiss_enabled:
                 top_scores, top_indices = faiss_index.search(normalized_embs[i:i + 1], k=min(args.positive_search_k + 1, n))
@@ -540,6 +824,7 @@ def main():
                 skipped += 1
                 if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
                     _log_progress()
+                maybe_save_checkpoint(checkpoint_path, args.checkpoint_every_anchors, anchors_processed, build_checkpoint_state(args, next_anchor_index=i + 1, rows=rows, skipped=skipped, anchors_processed=anchors_processed, anchors_with_triplets=anchors_with_triplets, missing_exact_positive=missing_exact_positive, missing_exact_negative=missing_exact_negative, positive_scores_logged=positive_scores_logged, negative_scores_logged=negative_scores_logged, positive_score_mode=positive_score_mode, negative_score_mode=negative_score_mode, faiss_enabled=faiss_enabled, num_sequences=len(seqs), embedding_dim=int(normalized_embs.shape[1]), start_time=start_time), tsv_handle=f)
                 continue
 
             forbidden = {i, *[idx for idx, _, _ in chosen_positives]}
@@ -548,6 +833,7 @@ def main():
                 skipped += 1
                 if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
                     _log_progress()
+                maybe_save_checkpoint(checkpoint_path, args.checkpoint_every_anchors, anchors_processed, build_checkpoint_state(args, next_anchor_index=i + 1, rows=rows, skipped=skipped, anchors_processed=anchors_processed, anchors_with_triplets=anchors_with_triplets, missing_exact_positive=missing_exact_positive, missing_exact_negative=missing_exact_negative, positive_scores_logged=positive_scores_logged, negative_scores_logged=negative_scores_logged, positive_score_mode=positive_score_mode, negative_score_mode=negative_score_mode, faiss_enabled=faiss_enabled, num_sequences=len(seqs), embedding_dim=int(normalized_embs.shape[1]), start_time=start_time), tsv_handle=f)
                 continue
             negative_pool = rng.sample([idx for idx in all_indices.tolist() if idx not in forbidden], k=neg_sample_size)
 
@@ -577,6 +863,7 @@ def main():
                 skipped += 1
                 if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
                     _log_progress()
+                maybe_save_checkpoint(checkpoint_path, args.checkpoint_every_anchors, anchors_processed, build_checkpoint_state(args, next_anchor_index=i + 1, rows=rows, skipped=skipped, anchors_processed=anchors_processed, anchors_with_triplets=anchors_with_triplets, missing_exact_positive=missing_exact_positive, missing_exact_negative=missing_exact_negative, positive_scores_logged=positive_scores_logged, negative_scores_logged=negative_scores_logged, positive_score_mode=positive_score_mode, negative_score_mode=negative_score_mode, faiss_enabled=faiss_enabled, num_sequences=len(seqs), embedding_dim=int(normalized_embs.shape[1]), start_time=start_time), tsv_handle=f)
                 continue
 
             if args.negative_pick_strategy == 'hardest':
@@ -607,8 +894,30 @@ def main():
                 anchors_with_triplets += 1
             if args.log_every_anchors and args.log_every_anchors > 0 and anchors_processed % args.log_every_anchors == 0:
                 _log_progress()
+            maybe_save_checkpoint(checkpoint_path, args.checkpoint_every_anchors, anchors_processed, build_checkpoint_state(args, next_anchor_index=i + 1, rows=rows, skipped=skipped, anchors_processed=anchors_processed, anchors_with_triplets=anchors_with_triplets, missing_exact_positive=missing_exact_positive, missing_exact_negative=missing_exact_negative, positive_scores_logged=positive_scores_logged, negative_scores_logged=negative_scores_logged, positive_score_mode=positive_score_mode, negative_score_mode=negative_score_mode, faiss_enabled=faiss_enabled, num_sequences=len(seqs), embedding_dim=int(normalized_embs.shape[1]), start_time=start_time), tsv_handle=f)
+
+        flush_tsv_file(f)
 
     meta_path = args.out_metadata_json or (out_path[:-4] + '.metadata.json' if out_path.endswith('.tsv') else out_path + '.metadata.json')
+    save_checkpoint(checkpoint_path, build_checkpoint_state(
+        args,
+        next_anchor_index=n,
+        rows=rows,
+        skipped=skipped,
+        anchors_processed=anchors_processed,
+        anchors_with_triplets=anchors_with_triplets,
+        missing_exact_positive=missing_exact_positive,
+        missing_exact_negative=missing_exact_negative,
+        positive_scores_logged=positive_scores_logged,
+        negative_scores_logged=negative_scores_logged,
+        positive_score_mode=positive_score_mode,
+        negative_score_mode=negative_score_mode,
+        faiss_enabled=faiss_enabled,
+        num_sequences=len(seqs),
+        embedding_dim=int(normalized_embs.shape[1]),
+        start_time=start_time,
+    ))
+
     meta = {
         'swiss_fasta': os.path.abspath(args.swiss_fasta),
         'swiss_tmvec_emb_npy': os.path.abspath(args.swiss_tmvec_emb_npy),
@@ -641,6 +950,9 @@ def main():
     }
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2, sort_keys=True)
+
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     _log_progress(force=True)
     elapsed = max(time.time() - start_time, 1e-9)

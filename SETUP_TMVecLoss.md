@@ -64,7 +64,8 @@ python generate_tmvec_pairs_tsv.py \
   --use_faiss \
   --seed 2021 \
   --max_proteins 15000 \
-  --log_every_anchors 1000
+  --log_every_anchors 1000 \
+  --resume
 ```
 
 ---
@@ -114,8 +115,11 @@ python generate_tmvec_pairs_tsv.py \
   --use_faiss \
   --seed 2021 \
   --max_proteins 300000 \
-  --log_every_anchors 100
+  --log_every_anchors 100 \
+  --resume
 ```
+
+Checkpoints are saved during training. If interrupted, make sure `--resume` is included in the command and re-run.
 
 ---
 
