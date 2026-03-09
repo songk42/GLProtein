@@ -1,33 +1,36 @@
 """
-Extract alpha-carbon (Cα) coordinates from a folder of PDB / mmCIF(.gz) files
+Extract alpha-carbon (Cα) coordinates from a folder of PDB(.gz) / mmCIF(.gz) files
 and save them as a pkl file suitable for use as `coordinates_path` in the
 GLProtein dataset.
 
 Output formats:
+    TSV-ID-compatible mode:
+        dict[str, list[list[float]]]
+        {raw_fasta_id_token: [[x, y, z], ...]}
+
     Legacy integer-keyed mode:
         dict[int, list[list[float]]]
         {protein_index: [[x, y, z], ...]}
 
-    TSV-ID-compatible mode (recommended for triplet + local structure):
-        dict[str, list[list[float]]]
-        {raw_fasta_id_token: [[x, y, z], ...]}
 
 When `--key-mode tsv_id` is used, the extractor reads the FASTA headers and
 maps AlphaFold/structure accessions back to the raw FASTA ID tokens written by
 `generate_tmvec_pairs_tsv.py` into anchor_id / positive_id / negative_id.
 
 Usage:
-    python src_refactor/extract_ca_coords.py \
+    TSV-ID-compatible mode:
+    python scripts_refactor/extract_ca_coords.py \
         --input-dir /path/to/structures \
-        --output coordinates.pkl \
+        --output /path/to/coordinates.pkl \
         --key-mode tsv_id \
         --fasta /path/to/swissprot.fasta
 
-    python src_refactor/extract_ca_coords.py \
+    Legacy integer-keyed mode:
+    python scripts_refactor/extract_ca_coords.py \
         --input-dir /path/to/structures \
-        --output coordinates.pkl \
+        --output /path/to/coordinates.pkl \
         --key-mode index \
-        [--index-map id_map.tsv]
+        [--index-map /path/to/id_map.tsv]
 """
 
 import argparse
@@ -36,6 +39,7 @@ import io
 import pickle
 import sys
 import warnings
+import time
 from pathlib import Path
 
 # Suppress noisy BioPython warnings (e.g. discontinuous chains)
@@ -142,8 +146,15 @@ def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = Non
 def collect_structure_files(input_dir: Path) -> list[Path]:
     files = []
     for f in sorted(input_dir.iterdir()):
+        if not f.is_file():
+            continue
         name = f.name.lower()
-        if name.endswith(".pdb") or name.endswith(".cif") or name.endswith(".cif.gz"):
+        if (
+            name.endswith(".pdb")
+            or name.endswith(".pdb.gz")
+            or name.endswith(".cif")
+            or name.endswith(".cif.gz")
+        ):
             files.append(f)
     return sorted(files, key=lambda p: p.name.lower())
 
@@ -168,7 +179,7 @@ def load_index_map(tsv_path: Path) -> dict[str, int]:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input-dir", required=True, type=Path, help="Folder containing .pdb / .cif / .cif.gz files")
+    parser.add_argument("--input-dir", required=True, type=Path, help="Folder containing .pdb / .pdb.gz / .cif / .cif.gz files")
     parser.add_argument("--output", required=True, type=Path, help="Output .pkl path")
     parser.add_argument(
         "--key-mode",
@@ -190,6 +201,12 @@ def main():
     )
     parser.add_argument("--chain", type=str, default=None, help="Restrict to this chain ID (default: all)")
     parser.add_argument("--model", type=int, default=0, help="MODEL index to use (default: 0)")
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=500,
+        help="Log extraction progress every N files for large folders (default: 500)",
+    )
     args = parser.parse_args()
 
     if not args.input_dir.is_dir():
@@ -197,7 +214,9 @@ def main():
 
     files = collect_structure_files(args.input_dir)
     if not files:
-        sys.exit(f"No .pdb / .cif / .cif.gz files found in {args.input_dir}")
+        sys.exit(f"No .pdb / .pdb.gz / .cif / .cif.gz files found in {args.input_dir}")
+
+    print(f"[info] found {len(files)} structure files in {args.input_dir}")
 
     accession_to_tsv_id = None
     if args.key_mode == "tsv_id":
@@ -221,14 +240,25 @@ def main():
 
     result = {}
     failed = []
+    skipped = 0
+    started_at = time.time()
 
     for file_idx, path in enumerate(files):
+        if file_idx == 0 or ((file_idx + 1) % max(1, args.log_every) == 0):
+            elapsed = time.time() - started_at
+            rate = (file_idx + 1) / elapsed if elapsed > 0 else 0.0
+            print(
+                f"[progress] processed {file_idx + 1}/{len(files)} files | "
+                f"saved={len(result)} skipped_or_failed={len(failed) + skipped} | "
+                f"elapsed={elapsed:.1f}s rate={rate:.2f} files/s"
+            )
         if args.key_mode == "index":
             if index_map is not None:
                 stem = path.name.removesuffix(".gz")
                 stem = Path(stem).stem
                 if stem not in index_map:
                     print(f"  [skip] {path.name}: stem '{stem}' not in index map")
+                    skipped += 1
                     continue
                 protein_key = index_map[stem]
             else:
@@ -237,6 +267,7 @@ def main():
             accession = stem_to_accession(path)
             if accession not in accession_to_tsv_id:
                 print(f"  [skip] {path.name}: accession '{accession}' not in FASTA map")
+                skipped += 1
                 continue
             protein_key = accession_to_tsv_id[accession]
 
@@ -253,7 +284,14 @@ def main():
             continue
 
         result[protein_key] = coords
-        print(f"  [{protein_key}] {path.name}: {len(coords)} residues")
+        if file_idx < 10:
+            print(f"  [{protein_key}] {path.name}: {len(coords)} residues")
+
+    elapsed = time.time() - started_at
+    print(
+        f"[done] processed {len(files)} files | saved={len(result)} skipped={skipped} failed={len(failed)} | "
+        f"elapsed={elapsed:.1f}s"
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:

@@ -51,7 +51,7 @@ Download it from https://alphafold.ebi.ac.uk/download#swissprot-section and plac
 Run the following to construct `tmvec_triplets_small.tsv` in `/data/pretrain_data`:
 
 ```bash
-python generate_tmvec_pairs_tsv.py \
+python scripts_refactor/generate_tmvec_pairs_tsv.py \
   --swiss_fasta data/pretrain_data/swissprot_seq.fasta \
   --swiss_tmvec_emb_npy data/pretrain_data/swiss_large.npy \
   --out_tsv data/pretrain_data/tmvec_triplets_small.tsv \
@@ -102,7 +102,7 @@ python run_pretrain_refactor.py \
 ## (6) Full triplet construction
 
 ```bash
-python generate_tmvec_pairs_tsv.py \
+python scripts_refactor/generate_tmvec_pairs_tsv.py \
   --swiss_fasta data/pretrain_data/swissprot_seq.fasta \
   --swiss_tmvec_emb_npy data/pretrain_data/swiss_large.npy \
   --out_tsv data/pretrain_data/tmvec_triplets_full.tsv \
