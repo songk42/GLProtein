@@ -18,29 +18,24 @@ maps AlphaFold/structure accessions back to the raw FASTA ID tokens written by
 `generate_tmvec_pairs_tsv.py` into anchor_id / positive_id / negative_id.
 
 Usage:
-    TSV-ID-compatible mode:
     python scripts_refactor/extract_ca_coords.py \
         --input-dir /path/to/structures \
         --output /path/to/coordinates.pkl \
         --key-mode tsv_id \
-        --fasta /path/to/swissprot.fasta
-
-    Legacy integer-keyed mode:
-    python scripts_refactor/extract_ca_coords.py \
-        --input-dir /path/to/structures \
-        --output /path/to/coordinates.pkl \
-        --key-mode index \
-        [--index-map /path/to/id_map.tsv]
+        --fasta /path/to/swissprot.fasta \
+        --resume
 """
 
 import argparse
 import gzip
 import io
+import os
 import pickle
 import sys
 import warnings
 import time
 from pathlib import Path
+from typing import Any
 
 # Suppress noisy BioPython warnings (e.g. discontinuous chains)
 warnings.filterwarnings("ignore")
@@ -177,6 +172,102 @@ def load_index_map(tsv_path: Path) -> dict[str, int]:
     return mapping
 
 
+def file_priority(path: Path) -> tuple[int, str]:
+    name = path.name.lower()
+    if name.endswith(".pdb.gz"):
+        rank = 0
+    elif name.endswith(".pdb"):
+        rank = 1
+    elif name.endswith(".cif.gz"):
+        rank = 2
+    elif name.endswith(".cif"):
+        rank = 3
+    else:
+        rank = 99
+    return (rank, name)
+
+
+def prefilter_tsv_files(files: list[Path], accession_to_tsv_id: dict[str, str]) -> tuple[list[Path], int]:
+    kept: list[Path] = []
+    pre_skipped = 0
+    for path in files:
+        accession = stem_to_accession(path)
+        if accession in accession_to_tsv_id:
+            kept.append(path)
+        else:
+            pre_skipped += 1
+    return kept, pre_skipped
+
+
+def dedupe_tsv_files(files: list[Path]) -> tuple[list[Path], int, list[str]]:
+    best_by_accession: dict[str, Path] = {}
+    dropped_examples: list[str] = []
+    dropped = 0
+    for path in files:
+        accession = stem_to_accession(path)
+        current = best_by_accession.get(accession)
+        if current is None or file_priority(path) < file_priority(current):
+            if current is not None:
+                dropped += 1
+                if len(dropped_examples) < 10:
+                    dropped_examples.append(f"{current.name} -> {path.name} [{accession}]")
+            best_by_accession[accession] = path
+        else:
+            dropped += 1
+            if len(dropped_examples) < 10:
+                dropped_examples.append(f"{path.name} dropped; kept {current.name} [{accession}]")
+    deduped = sorted(best_by_accession.values(), key=lambda p: p.name.lower())
+    return deduped, dropped, dropped_examples
+
+
+def default_checkpoint_path(output_path: Path) -> Path:
+    return Path(str(output_path) + ".checkpoint.pkl")
+
+
+def save_checkpoint(checkpoint_path: Path, state: dict[str, Any]) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    with open(tmp_path, "wb") as fh:
+        pickle.dump(state, fh)
+    os.replace(tmp_path, checkpoint_path)
+
+
+def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
+    with open(checkpoint_path, "rb") as fh:
+        state = pickle.load(fh)
+    if not isinstance(state, dict):
+        raise ValueError(f"Checkpoint at {checkpoint_path} is not a dict")
+    return state
+
+
+def checkpoint_state(
+    result: dict[Any, list[list[float]]],
+    processed_files: set[str],
+    failed: list[str],
+    skipped: int,
+    saved_new: int,
+    overwritten: int,
+    overwrite_examples: list[str],
+    total_candidate_files: int,
+    pre_skipped: int,
+    dedup_dropped: int,
+    started_at: float,
+) -> dict[str, Any]:
+    return {
+        "result": result,
+        "processed_files": sorted(processed_files),
+        "failed": list(failed),
+        "skipped": int(skipped),
+        "saved_new": int(saved_new),
+        "overwritten": int(overwritten),
+        "overwrite_examples": list(overwrite_examples),
+        "total_candidate_files": int(total_candidate_files),
+        "pre_skipped": int(pre_skipped),
+        "dedup_dropped": int(dedup_dropped),
+        "started_at": float(started_at),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input-dir", required=True, type=Path, help="Folder containing .pdb / .pdb.gz / .cif / .cif.gz files")
@@ -205,20 +296,45 @@ def main():
         "--log-every",
         type=int,
         default=500,
-        help="Log extraction progress every N files for large folders (default: 500)",
+        help="Log extraction progress every N newly processed candidate files for large folders (default: 500)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing extraction checkpoint if present.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Path to a resume checkpoint file. Defaults to <output>.checkpoint.pkl",
+    )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=5000,
+        help="Save resume checkpoint every N newly processed candidate files (default: 5000)",
     )
     args = parser.parse_args()
 
     if not args.input_dir.is_dir():
         sys.exit(f"--input-dir {args.input_dir} is not a directory")
+    if args.save_every <= 0:
+        sys.exit("--save-every must be > 0")
+    if args.log_every <= 0:
+        sys.exit("--log-every must be > 0")
 
     files = collect_structure_files(args.input_dir)
     if not files:
         sys.exit(f"No .pdb / .pdb.gz / .cif / .cif.gz files found in {args.input_dir}")
 
-    print(f"[info] found {len(files)} structure files in {args.input_dir}")
+    total_found = len(files)
+    print(f"[info] found {total_found} structure files in {args.input_dir}")
 
     accession_to_tsv_id = None
+    pre_skipped = 0
+    dedup_dropped = 0
+    dedup_examples: list[str] = []
     if args.key_mode == "tsv_id":
         if args.fasta is None:
             sys.exit("--fasta is required when --key-mode tsv_id")
@@ -235,23 +351,72 @@ def main():
             print(
                 f"[warn] duplicate accessions in FASTA; keeping first mapping for {len(duplicate_accessions)} accession(s)"
             )
+        files, pre_skipped = prefilter_tsv_files(files, accession_to_tsv_id)
+        print(
+            f"[info] prefiltered files for tsv_id: keeping {len(files)} / {total_found}, "
+            f"pre-skipped {pre_skipped} not in FASTA map"
+        )
+        files, dedup_dropped, dedup_examples = dedupe_tsv_files(files)
+        print(
+            f"[info] deduplicated candidate files by accession: {total_found - pre_skipped} -> {len(files)} "
+            f"(dropped {dedup_dropped})"
+        )
+        if dedup_examples:
+            print("[info] dedup examples: " + "; ".join(dedup_examples[:5]))
 
     index_map = load_index_map(args.index_map) if args.index_map else None
 
-    result = {}
-    failed = []
+    total_candidate_files = len(files)
+    checkpoint_path = args.checkpoint_path or default_checkpoint_path(args.output)
+
+    result: dict[Any, list[list[float]]] = {}
+    failed: list[str] = []
     skipped = 0
+    saved_new = 0
+    overwritten = 0
+    overwrite_examples: list[str] = []
+    processed_files: set[str] = set()
     started_at = time.time()
 
-    for file_idx, path in enumerate(files):
-        if file_idx == 0 or ((file_idx + 1) % max(1, args.log_every) == 0):
-            elapsed = time.time() - started_at
-            rate = (file_idx + 1) / elapsed if elapsed > 0 else 0.0
+    if args.resume:
+        if checkpoint_path.exists():
+            state = load_checkpoint(checkpoint_path)
+            result = state.get("result", {})
+            processed_files = set(state.get("processed_files", []))
+            failed = list(state.get("failed", []))
+            skipped = int(state.get("skipped", 0))
+            saved_new = int(state.get("saved_new", len(result)))
+            overwritten = int(state.get("overwritten", 0))
+            overwrite_examples = list(state.get("overwrite_examples", []))
+            ck_total_candidate = state.get("total_candidate_files")
+            ck_pre_skipped = state.get("pre_skipped")
+            ck_dedup_dropped = state.get("dedup_dropped")
+            if ck_total_candidate is not None and int(ck_total_candidate) != total_candidate_files:
+                print(
+                    f"[warn] checkpoint candidate file count {ck_total_candidate} differs from current {total_candidate_files}; continuing with current file list"
+                )
+            if ck_pre_skipped is not None and int(ck_pre_skipped) != pre_skipped:
+                print(
+                    f"[warn] checkpoint pre-skipped count {ck_pre_skipped} differs from current {pre_skipped}; continuing with current file list"
+                )
+            if ck_dedup_dropped is not None and int(ck_dedup_dropped) != dedup_dropped:
+                print(
+                    f"[warn] checkpoint dedup-dropped count {ck_dedup_dropped} differs from current {dedup_dropped}; continuing with current file list"
+                )
             print(
-                f"[progress] processed {file_idx + 1}/{len(files)} files | "
-                f"saved={len(result)} skipped_or_failed={len(failed) + skipped} | "
-                f"elapsed={elapsed:.1f}s rate={rate:.2f} files/s"
+                f"[resume] loaded checkpoint {checkpoint_path} | processed={len(processed_files)}/{total_candidate_files} "
+                f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)}"
             )
+        else:
+            print(f"[resume] no checkpoint found at {checkpoint_path}; starting fresh")
+
+    last_checkpoint_processed = len(processed_files)
+
+    for loop_idx, path in enumerate(files):
+        file_token = path.name
+        if file_token in processed_files:
+            continue
+
         if args.key_mode == "index":
             if index_map is not None:
                 stem = path.name.removesuffix(".gz")
@@ -259,47 +424,106 @@ def main():
                 if stem not in index_map:
                     print(f"  [skip] {path.name}: stem '{stem}' not in index map")
                     skipped += 1
-                    continue
-                protein_key = index_map[stem]
+                    processed_files.add(file_token)
+                else:
+                    protein_key = index_map[stem]
             else:
-                protein_key = file_idx
+                protein_key = loop_idx
         else:
             accession = stem_to_accession(path)
             if accession not in accession_to_tsv_id:
                 print(f"  [skip] {path.name}: accession '{accession}' not in FASTA map")
                 skipped += 1
-                continue
-            protein_key = accession_to_tsv_id[accession]
+                processed_files.add(file_token)
+            else:
+                protein_key = accession_to_tsv_id[accession]
 
-        try:
-            coords = extract_ca_coords(path, model_idx=args.model, chain_id=args.chain)
-        except Exception as e:
-            print(f"  [error] {path.name}: {e}")
-            failed.append(path.name)
+        if file_token in processed_files:
+            pass
+        else:
+            try:
+                coords = extract_ca_coords(path, model_idx=args.model, chain_id=args.chain)
+            except Exception as e:
+                print(f"  [error] {path.name}: {e}")
+                failed.append(path.name)
+                processed_files.add(file_token)
+            else:
+                if not coords:
+                    print(f"  [warn]  {path.name}: no Cα atoms found, skipping")
+                    failed.append(path.name)
+                    processed_files.add(file_token)
+                else:
+                    if protein_key in result:
+                        overwritten += 1
+                        if len(overwrite_examples) < 10:
+                            overwrite_examples.append(f"{path.name} -> {protein_key}")
+                    else:
+                        saved_new += 1
+                    result[protein_key] = coords
+                    processed_files.add(file_token)
+                    if saved_new + overwritten <= 10:
+                        print(f"  [{protein_key}] {path.name}: {len(coords)} residues")
+
+        processed_count = len(processed_files)
+        if processed_count == 0:
             continue
 
-        if not coords:
-            print(f"  [warn]  {path.name}: no Cα atoms found, skipping")
-            failed.append(path.name)
-            continue
+        newly_processed_since_save = processed_count - last_checkpoint_processed
+        if processed_count == 1 or (processed_count % args.log_every == 0):
+            elapsed = time.time() - started_at
+            rate = processed_count / elapsed if elapsed > 0 else 0.0
+            print(
+                f"[progress] processed {processed_count}/{total_candidate_files} candidate files | "
+                f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)} | "
+                f"elapsed={elapsed:.1f}s rate={rate:.2f} files/s"
+            )
+        if newly_processed_since_save >= args.save_every:
+            save_checkpoint(
+                checkpoint_path,
+                checkpoint_state(
+                    result=result,
+                    processed_files=processed_files,
+                    failed=failed,
+                    skipped=skipped,
+                    saved_new=saved_new,
+                    overwritten=overwritten,
+                    overwrite_examples=overwrite_examples,
+                    total_candidate_files=total_candidate_files,
+                    pre_skipped=pre_skipped,
+                    dedup_dropped=dedup_dropped,
+                    started_at=started_at,
+                ),
+            )
+            print(f"[checkpoint] saved resume state to {checkpoint_path} at processed={processed_count}")
+            last_checkpoint_processed = processed_count
 
-        result[protein_key] = coords
-        if file_idx < 10:
-            print(f"  [{protein_key}] {path.name}: {len(coords)} residues")
-
+    processed_count = len(processed_files)
     elapsed = time.time() - started_at
+    if processed_count != saved_new + overwritten + skipped + len(failed):
+        raise RuntimeError(
+            "Accounting mismatch: processed != saved_new + overwritten + skipped + failed "
+            f"({processed_count} != {saved_new} + {overwritten} + {skipped} + {len(failed)})"
+        )
+
     print(
-        f"[done] processed {len(files)} files | saved={len(result)} skipped={skipped} failed={len(failed)} | "
-        f"elapsed={elapsed:.1f}s"
+        f"[done] total_found={total_found} | pre_skipped={pre_skipped} | dedup_dropped={dedup_dropped} | "
+        f"processed={processed_count}/{total_candidate_files} | saved_new={saved_new} overwritten={overwritten} "
+        f"skipped={skipped} failed={len(failed)} | unique_keys={len(result)} | elapsed={elapsed:.1f}s"
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:
         pickle.dump(result, fh)
 
-    print(f"\nSaved {len(result)} proteins -> {args.output}")
+    print(f"\nSaved {len(result)} unique protein keys -> {args.output}")
+    if overwrite_examples:
+        print("Overwrite examples: " + "; ".join(overwrite_examples[:10]))
     if failed:
-        print(f"Skipped / failed ({len(failed)}): {', '.join(failed[:10])}" + (" ..." if len(failed) > 10 else ""))
+        print(f"Failed ({len(failed)}): {', '.join(failed[:10])}" + (" ..." if len(failed) > 10 else ""))
+
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print(f"[cleanup] removed checkpoint file {checkpoint_path}")
 
 
 if __name__ == "__main__":
