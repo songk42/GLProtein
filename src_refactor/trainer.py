@@ -1,12 +1,16 @@
 import json
 import os
 import math
+import csv
+import random
+import shutil
 import collections
 import time
 from tqdm import trange
 from packaging import version
 from typing import Optional, Tuple, Union, Dict, Any, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,16 +25,45 @@ from transformers.trainer_pt_utils import get_parameter_names, IterableDatasetSh
 from transformers.optimization import Adafactor
 from torch.optim import AdamW
 from transformers.trainer_callback import TrainerState
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.file_utils import is_apex_available, is_sagemaker_mp_enabled
 
 from src_refactor.dataset import GoGoDataset, ProteinGoDataset, ProteinSeqDataset, ProteinSeqTripletDataset
 from src_refactor.dataloader import DataCollatorForLanguageModeling, DataCollatorForGoGo, DataCollatorForProteinGo
 from src_refactor.models import GLProtein, KnowledgeDecoder, GLProteinLoss, TMVecLoss, GlobalStructureTripletLoss
-from src.optimization import get_scheduler
+from src_refactor.optimization import get_scheduler
 
 
 logger = logging.get_logger(__name__)
 
+
+
+
+def _sorted_checkpoints(output_dir: str) -> List[str]:
+    checkpoints: List[Tuple[int, str]] = []
+    if not output_dir or not os.path.isdir(output_dir):
+        return []
+    prefix = f"{PREFIX_CHECKPOINT_DIR}-"
+    for name in os.listdir(output_dir):
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        if not suffix.isdigit():
+            continue
+        path = os.path.join(output_dir, name)
+        if os.path.isdir(path):
+            checkpoints.append((int(suffix), path))
+    checkpoints.sort(key=lambda x: x[0])
+    return [path for _, path in checkpoints]
+
+
+def _checkpoint_step(checkpoint_path: str) -> int:
+    base = os.path.basename(os.path.normpath(checkpoint_path))
+    if base.startswith(f"{PREFIX_CHECKPOINT_DIR}-"):
+        suffix = base[len(f"{PREFIX_CHECKPOINT_DIR}-"):]
+        if suffix.isdigit():
+            return int(suffix)
+    return 0
 
 # if is_apex_available():
 #     from apex import amp
@@ -271,6 +304,85 @@ class GLProteinTrainer(Trainer):
                 )
 
         self.use_amp = False
+        self.loss_recorder = []
+        self.loss_trace_file = os.path.join(self.args.output_dir, "loss_trace.jsonl") if getattr(self.args, "output_dir", None) else None
+
+
+    def _append_loss_trace(self, record: Dict[str, Any]) -> None:
+        if not self.loss_trace_file:
+            return
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        with open(self.loss_trace_file, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _write_loss_trace_csv(self, output_dir: str) -> None:
+        if not self.loss_recorder:
+            return
+        fieldnames: List[str] = []
+        for row in self.loss_recorder:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        csv_path = os.path.join(output_dir, 'loss_trace.csv')
+        with open(csv_path, 'w', encoding='utf-8', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self.loss_recorder:
+                writer.writerow(row)
+
+    def _save_rng_state(self, output_dir: str) -> None:
+        rng_state = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            rng_state['cuda'] = torch.cuda.get_rng_state_all()
+        torch.save(rng_state, os.path.join(output_dir, 'rng_state.pth'))
+
+    def _load_rng_state(self, checkpoint_dir: str) -> None:
+        rng_path = os.path.join(checkpoint_dir, 'rng_state.pth')
+        if not os.path.exists(rng_path):
+            return
+        rng_state = torch.load(rng_path, map_location='cpu')
+        random.setstate(rng_state['python'])
+        np.random.set_state(rng_state['numpy'])
+        torch.set_rng_state(rng_state['torch'])
+        if torch.cuda.is_available() and 'cuda' in rng_state:
+            torch.cuda.set_rng_state_all(rng_state['cuda'])
+
+    def _load_loss_trace(self, checkpoint_dir: str) -> None:
+        loss_path = os.path.join(checkpoint_dir, 'loss_trace.json')
+        if not os.path.exists(loss_path):
+            self.loss_recorder = []
+            return
+        with open(loss_path, 'r', encoding='utf-8') as handle:
+            self.loss_recorder = json.load(handle)
+        if self.loss_trace_file:
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            with open(self.loss_trace_file, 'w', encoding='utf-8') as handle:
+                for row in self.loss_recorder:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _rotate_checkpoints(self) -> None:
+        save_total_limit = getattr(self.args, 'save_total_limit', None)
+        if save_total_limit is None or save_total_limit <= 0:
+            return
+        checkpoints = _sorted_checkpoints(self.args.output_dir)
+        excess = len(checkpoints) - int(save_total_limit)
+        for checkpoint in checkpoints[:max(0, excess)]:
+            shutil.rmtree(checkpoint, ignore_errors=True)
+
+    def _load_non_deepspeed_checkpoint(self, checkpoint_dir: str) -> None:
+        logger.info("Loading model state from checkpoint %s", checkpoint_dir)
+        self._load_from_checkpoint(checkpoint_dir)
+        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        if os.path.exists(trainer_state_path):
+            self.state = TrainerState.load_from_json(trainer_state_path)
+        self._load_optimizer_and_scheduler(checkpoint_dir)
+        self._load_rng_state(checkpoint_dir)
+        self._load_loss_trace(checkpoint_dir)
+
 
     def train(
         self,
@@ -370,7 +482,10 @@ class GLProteinTrainer(Trainer):
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         # Check if saved optimizer or scheduler states exist
-        self._load_optimizer_and_scheduler(resume_from_checkpoint)
+        if resume_from_checkpoint and not self.deepspeed:
+            self._load_non_deepspeed_checkpoint(resume_from_checkpoint)
+        else:
+            self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
         # Train
         num_protein_seq_examples = (
@@ -394,21 +509,19 @@ class GLProteinTrainer(Trainer):
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         logger.info(f"  Total optimization steps = {max_steps}")
 
-        self.state.epoch = 0
         start_time = time.time()
+        raw_steps_trained = int(self.state.global_step)
         epochs_trained = 0
         steps_trained_in_current_epoch = 0
         steps_trained_progress_bar = None
 
         tr_loss = torch.tensor(0.0).to(args.device)
-        self.loss_recorder = []
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
         model.zero_grad()
 
         if isinstance(protein_seq_dataloader, DataLoader) and isinstance(protein_seq_dataloader.sampler, DistributedSampler):
-            # protein_seq_dataloader.sampler.set_epoch(0)
-            protein_go_dataloader.sampler.set_epoch(0)
+            protein_seq_dataloader.sampler.set_epoch(0)
 
         protein_seq_iter = iter(protein_seq_dataloader) if protein_seq_dataloader else None
         # protein_go_iter = iter(protein_go_dataloader) if protein_go_dataloader else None
@@ -424,6 +537,28 @@ class GLProteinTrainer(Trainer):
         # record epoch for update of seed on dataloaders.
         cur_protein_seq_epoch = 0
         # cur_protein_go_epoch = 0
+
+        if raw_steps_trained > 0 and num_protein_seq_steps_per_epoch > 0:
+            epochs_trained = raw_steps_trained
+            cur_protein_seq_epoch = raw_steps_trained // num_protein_seq_steps_per_epoch
+            steps_trained_in_current_epoch = raw_steps_trained % num_protein_seq_steps_per_epoch
+            self.state.epoch = raw_steps_trained / max(num_protein_seq_steps_per_epoch, 1)
+            if isinstance(protein_seq_dataloader.sampler, DistributedSampler):
+                protein_seq_dataloader.sampler.set_epoch(cur_protein_seq_epoch)
+            elif isinstance(protein_seq_dataloader.dataset, IterableDatasetShard):
+                protein_seq_dataloader.dataset.set_epoch(cur_protein_seq_epoch)
+            protein_seq_iter = iter(protein_seq_dataloader) if protein_seq_dataloader else None
+            for _ in range(steps_trained_in_current_epoch):
+                if protein_seq_iter is not None:
+                    next(protein_seq_iter)
+            logger.info(
+                "Resuming training from step %d (epoch index %d, step offset %d within epoch)",
+                raw_steps_trained,
+                cur_protein_seq_epoch,
+                steps_trained_in_current_epoch,
+            )
+        else:
+            self.state.epoch = 0
 
         train_iterator = range(
             epochs_trained, max_steps
@@ -483,12 +618,13 @@ class GLProteinTrainer(Trainer):
 
             # record loss.
             if args.local_rank == -1 or args.local_rank == 0:
-                all_loss['global_step'] = step
+                all_loss['global_step'] = int(self.state.global_step)
                 all_loss['learning_rate'] = self.get_learning_rate()
                 all_loss = dict(all_loss)
                 logger.info("loss and lr dict: %s",str(all_loss))
                 print(all_loss)
                 self.loss_recorder.append(all_loss)
+                self._append_loss_trace(all_loss)
 
             # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
             if self.deepspeed:
@@ -531,8 +667,9 @@ class GLProteinTrainer(Trainer):
                 model.zero_grad()
 
             self.state.global_step += 1
+            self.state.epoch = (step + 1) / max(num_protein_seq_steps_per_epoch, 1) if num_protein_seq_steps_per_epoch > 0 else 0
 
-            if args.save_steps > 0 and (step + 1) % args.save_steps == 0:
+            if args.save_steps > 0 and self.state.global_step % args.save_steps == 0:
                 self._save_checkpoint()
 
             # print("forward propagation time",time.time()-tempt)
@@ -571,10 +708,23 @@ class GLProteinTrainer(Trainer):
         self._save(output_dir)
         if self.deepspeed:
             self.deepspeed.save_checkpoint(output_dir)
+        else:
+            if self.optimizer is not None:
+                torch.save(self.optimizer.state_dict(), os.path.join(output_dir, 'optimizer.pt'))
+            if self.lr_scheduler is not None:
+                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
+            self.state.save_to_json(os.path.join(output_dir, 'trainer_state.json'))
+            self._save_rng_state(output_dir)
 
         # save loss traces.
         with open(os.path.join(output_dir, 'loss_trace.json'), 'w', encoding='utf-8') as handle:
             handle.write(json.dumps(self.loss_recorder, indent=2, ensure_ascii=False))
+        self._write_loss_trace_csv(output_dir)
+        # keep latest copies in output_dir for easier visualization
+        with open(os.path.join(self.args.output_dir, 'loss_trace.json'), 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(self.loss_recorder, indent=2, ensure_ascii=False))
+        self._write_loss_trace_csv(self.args.output_dir)
+        self._rotate_checkpoints()
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.

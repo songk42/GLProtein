@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 # import json
 # import torch.nn as nn
@@ -8,14 +9,32 @@ from transformers import BertTokenizer, AutoTokenizer, logging
 
 from src_refactor.models import GLProtein, GLProteinConfig, KnowledgeDecoder
 from src_refactor.trainer import GLProteinTrainer
-from src.sampling import negative_sampling_strategy
+from src_refactor.sampling import negative_sampling_strategy
 from src_refactor.dataset import ProteinSeqDataset, ProteinSeqPairDataset, ProteinSeqTripletDataset, ProteinGoDataset
 from src_refactor.dataloader import DataCollatorForGoGo, DataCollatorForLanguageModeling, DataCollatorForProteinGo
 from src_refactor.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
 
 logger = logging.get_logger(__name__)
-import torch
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = 'cpu'
+
+
+def _find_latest_checkpoint(output_dir: str):
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    latest_path = None
+    latest_step = -1
+    pattern = re.compile(r"^checkpoint-(\d+)$")
+    for name in os.listdir(output_dir):
+        match = pattern.match(name)
+        if not match:
+            continue
+        step = int(match.group(1))
+        path = os.path.join(output_dir, name)
+        if os.path.isdir(path) and step > latest_step:
+            latest_step = step
+            latest_path = path
+    return latest_path
+
 
 
 def main():
@@ -80,6 +99,8 @@ def main():
                     tokenizer=protein_tokenizer,
                     max_protein_seq_length=data_args.max_protein_seq_length,
                     protein_seq_sample_limit=data_args.protein_seq_sample_limit,
+                    coordinates_path=data_args.coordinates_path,
+                    aa_vec_model_path=data_args.aa_vec_model_path,
                 )
             else:
                 if data_args.tmvec_pairs_tsv is None:
@@ -99,9 +120,7 @@ def main():
                 data_dir=data_args.pretrain_data_dir,
                 tokenizer=protein_tokenizer,
                 max_protein_seq_length=data_args.max_protein_seq_length,
-                protein_seq_sample_limit=data_args.protein_seq_sample_limit,
-                coordinates_path=data_args.coordinates_path,
-                aa_vec_model_path=data_args.aa_vec_model_path,
+                protein_seq_sample_limit=data_args.protein_seq_sample_limit
             )
 
     # # whether to use protein function inference task during pretraining
@@ -169,7 +188,18 @@ def main():
     # Pretraining
     if training_args.do_train:
         # add path to checkpoint here to resume training
-        trainer.train()
+        resolved_resume_checkpoint = None
+        if training_args.resume_from_checkpoint:
+            resolved_resume_checkpoint = training_args.resume_from_checkpoint
+        elif training_args.auto_resume_from_latest:
+            resolved_resume_checkpoint = _find_latest_checkpoint(training_args.output_dir)
+
+        if resolved_resume_checkpoint:
+            logger.info(f"Resuming training from checkpoint: {resolved_resume_checkpoint}")
+        else:
+            logger.info("Starting training from scratch")
+
+        trainer.train(resume_from_checkpoint=resolved_resume_checkpoint)
 
 
 if __name__ == "__main__":

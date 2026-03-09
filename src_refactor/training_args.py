@@ -7,7 +7,7 @@ from typing import Optional
 from transformers import logging
 from transformers.training_args import TrainingArguments
 
-from src.sampling import negative_sampling_strategy
+from src_refactor.sampling import negative_sampling_strategy
 
 
 @dataclass
@@ -259,14 +259,18 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Whether or not to train the model."}
     )
 
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a checkpoint directory to resume training from."}
+    )
+    auto_resume_from_latest: bool = field(
+        default=False,
+        metadata={"help": "Automatically resume from the latest checkpoint under output_dir if available."}
+    )
+
     adafactor: bool = field(
         default=False,
         metadata={"help": "Whether or not to use adafactor optimizer."}
-    )
-
-    save_steps: int = field(
-        default=0,
-        metadata={"help": "Save a checkpoint every N optimizer steps. 0 disables mid-training saves (a final checkpoint is always saved at the end)."}
     )
 
     def __post_init__(self):
@@ -425,11 +429,12 @@ class DataArguments:
 
     coordinates_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to pickle file mapping protein index -> list of [x,y,z] alpha-C coordinates (from AlphaFoldDB)."}
+        metadata={"help": "Optional path to pickled AlphaFold alpha-carbon coordinates."}
     )
+
     aa_vec_model_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to pretrained mol2vec Word2Vec model file (model_300dim.pkl) for amino acid substructure embeddings."}
+        metadata={"help": "Optional path to the mol2vec model used for amino-acid molecular encodings."}
     )
 
     # negative sampling

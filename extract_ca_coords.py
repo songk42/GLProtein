@@ -3,28 +3,36 @@ Extract alpha-carbon (Cα) coordinates from a folder of PDB / mmCIF(.gz) files
 and save them as a pkl file suitable for use as `coordinates_path` in the
 GLProtein dataset.
 
-Output format:
-    dict[int, list[list[float]]]
-    {protein_index: [[x, y, z], ...]}  -- one [x,y,z] per residue, in chain order
+Output formats:
+    Legacy integer-keyed mode:
+        dict[int, list[list[float]]]
+        {protein_index: [[x, y, z], ...]}
 
-Protein indices are assigned by sorting the input files alphabetically (0-based).
-If your files need to map to specific SwissProt indices, pass --index-map, a
-two-column TSV: <filename_stem>  <integer_index>
+    TSV-ID-compatible mode (recommended for triplet + local structure):
+        dict[str, list[list[float]]]
+        {raw_fasta_id_token: [[x, y, z], ...]}
+
+When `--key-mode tsv_id` is used, the extractor reads the FASTA headers and
+maps AlphaFold/structure accessions back to the raw FASTA ID tokens written by
+`generate_tmvec_pairs_tsv.py` into anchor_id / positive_id / negative_id.
 
 Usage:
-    python scripts/extract_ca_coords.py \\
-        --input-dir /path/to/structures \\
-        --output coordinates.pkl \\
-        [--index-map id_map.tsv] \\
-        [--chain A]          # restrict to a specific chain (default: all chains)
-        [--model 0]          # which MODEL to use (default: 0, i.e. first)
+    python src_refactor/extract_ca_coords.py \
+        --input-dir /path/to/structures \
+        --output coordinates.pkl \
+        --key-mode tsv_id \
+        --fasta /path/to/swissprot.fasta
 
+    python src_refactor/extract_ca_coords.py \
+        --input-dir /path/to/structures \
+        --output coordinates.pkl \
+        --key-mode index \
+        [--index-map id_map.tsv]
 """
 
 import argparse
 import gzip
 import io
-import os
 import pickle
 import sys
 import warnings
@@ -56,6 +64,35 @@ def _open_file(path: Path):
 def _is_cif(path: Path) -> bool:
     suffixes = {s.lower() for s in path.suffixes}
     return ".cif" in suffixes
+
+
+def parse_accession(seq_id: str) -> str:
+    token = seq_id.split()[0]
+    if "|" in token:
+        parts = token.split("|")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    if token.startswith("AF-") and "-F1" in token:
+        parts = token.split("-")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return token
+
+
+def read_fasta_ids(path: Path) -> list[str]:
+    ids: list[str] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                ids.append(line[1:].split()[0])
+    return ids
+
+
+def stem_to_accession(path: Path) -> str:
+    stem = path.name.removesuffix(".gz")
+    stem = Path(stem).stem
+    return parse_accession(stem)
 
 
 def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = None) -> list[list[float]]:
@@ -92,7 +129,6 @@ def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = Non
         if chain_id is not None and chain.id != chain_id:
             continue
         for residue in chain.get_residues():
-            # Skip HETATM records (waters, ligands, etc.)
             if residue.id[0] != " ":
                 continue
             if "CA" in residue:
@@ -104,7 +140,6 @@ def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = Non
 
 
 def collect_structure_files(input_dir: Path) -> list[Path]:
-    extensions = {".pdb", ".cif", ".cif.gz"}
     files = []
     for f in sorted(input_dir.iterdir()):
         name = f.name.lower()
@@ -135,8 +170,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input-dir", required=True, type=Path, help="Folder containing .pdb / .cif / .cif.gz files")
     parser.add_argument("--output", required=True, type=Path, help="Output .pkl path")
-    parser.add_argument("--index-map", type=Path, default=None,
-                        help="Optional TSV mapping filename stem -> integer index")
+    parser.add_argument(
+        "--key-mode",
+        choices=["index", "tsv_id"],
+        default="index",
+        help="Output key mode: integer index (legacy) or raw FASTA ID token matching generate_tmvec_pairs_tsv.py",
+    )
+    parser.add_argument(
+        "--fasta",
+        type=Path,
+        default=None,
+        help="Optional FASTA used to map structure accessions back to raw FASTA ID tokens",
+    )
+    parser.add_argument(
+        "--index-map",
+        type=Path,
+        default=None,
+        help="Optional TSV mapping filename stem -> integer index (legacy index mode only)",
+    )
     parser.add_argument("--chain", type=str, default=None, help="Restrict to this chain ID (default: all)")
     parser.add_argument("--model", type=int, default=0, help="MODEL index to use (default: 0)")
     args = parser.parse_args()
@@ -148,23 +199,46 @@ def main():
     if not files:
         sys.exit(f"No .pdb / .cif / .cif.gz files found in {args.input_dir}")
 
+    accession_to_tsv_id = None
+    if args.key_mode == "tsv_id":
+        if args.fasta is None:
+            sys.exit("--fasta is required when --key-mode tsv_id")
+        fasta_ids = read_fasta_ids(args.fasta)
+        accession_to_tsv_id = {}
+        duplicate_accessions = set()
+        for seq_id in fasta_ids:
+            accession = parse_accession(seq_id)
+            if accession in accession_to_tsv_id and accession_to_tsv_id[accession] != seq_id:
+                duplicate_accessions.add(accession)
+                continue
+            accession_to_tsv_id.setdefault(accession, seq_id)
+        if duplicate_accessions:
+            print(
+                f"[warn] duplicate accessions in FASTA; keeping first mapping for {len(duplicate_accessions)} accession(s)"
+            )
+
     index_map = load_index_map(args.index_map) if args.index_map else None
 
-    result: dict[int, list[list[float]]] = {}
+    result = {}
     failed = []
 
     for file_idx, path in enumerate(files):
-        # Determine the integer key for this protein
-        if index_map is not None:
-            # Strip all suffixes to get the stem (handles .cif.gz)
-            stem = path.name.removesuffix(".gz")
-            stem = Path(stem).stem
-            if stem not in index_map:
-                print(f"  [skip] {path.name}: stem '{stem}' not in index map")
-                continue
-            protein_idx = index_map[stem]
+        if args.key_mode == "index":
+            if index_map is not None:
+                stem = path.name.removesuffix(".gz")
+                stem = Path(stem).stem
+                if stem not in index_map:
+                    print(f"  [skip] {path.name}: stem '{stem}' not in index map")
+                    continue
+                protein_key = index_map[stem]
+            else:
+                protein_key = file_idx
         else:
-            protein_idx = file_idx
+            accession = stem_to_accession(path)
+            if accession not in accession_to_tsv_id:
+                print(f"  [skip] {path.name}: accession '{accession}' not in FASTA map")
+                continue
+            protein_key = accession_to_tsv_id[accession]
 
         try:
             coords = extract_ca_coords(path, model_idx=args.model, chain_id=args.chain)
@@ -178,8 +252,8 @@ def main():
             failed.append(path.name)
             continue
 
-        result[protein_idx] = coords
-        print(f"  [{protein_idx:>6}] {path.name}: {len(coords)} residues")
+        result[protein_key] = coords
+        print(f"  [{protein_key}] {path.name}: {len(coords)} residues")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:
@@ -187,8 +261,7 @@ def main():
 
     print(f"\nSaved {len(result)} proteins -> {args.output}")
     if failed:
-        print(f"Skipped / failed ({len(failed)}): {', '.join(failed[:10])}" +
-              (" ..." if len(failed) > 10 else ""))
+        print(f"Skipped / failed ({len(failed)}): {', '.join(failed[:10])}" + (" ..." if len(failed) > 10 else ""))
 
 
 if __name__ == "__main__":

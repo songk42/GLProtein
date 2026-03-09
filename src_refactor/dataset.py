@@ -156,8 +156,6 @@ class ProteinSeqInputFeatures:
     """
     input_ids: List[int]
     coordinates: Optional[List[List[float]]] = None
-    aa_vec: Optional[List[List[float]]] = None
-    sequence: Optional[str] = None
     label: Optional[Union[int, float]] = None
     
 
@@ -478,18 +476,26 @@ class ProteinSeqDataset(Dataset):
         tokenizer: PreTrainedTokenizerBase = None,
         in_memory: bool=True,
         max_protein_seq_length: int = None,
-        protein_seq_sample_limit: Optional[int] = None,
-        coordinates_path: Optional[str] = None,
-        aa_vec_model_path: Optional[str] = None,
+        protein_seq_sample_limit: Optional[int] = None
     ):
         self.data_dir = data_dir
         self.seq_data_path = seq_data_path
 
+        # self.env = lmdb.open(os.path.join(data_dir, seq_data_path), readonly=True)
+        
+        # with self.env.begin(write=False) as txn:
+        #     self.num_examples = pkl.loads(txn.get(b'num_examples'))
+
+        # self.in_memory = in_memory
+        # if in_memory:
+        #     cache = [None] * self.num_examples
+        #     self.cache = cache
+
         def trans_sequence(sequence):
             sequence = " ".join(sequence)
-            sequence = re.sub(r"[UZOB]", "X", sequence)
+            sequence = re.sub(r"[UZOB]", "X", sequence) 
             return sequence
-
+        
         with open(os.path.join(self.data_dir, "uniprot_sprot.dat")) as f:
             records = SwissProt.parse(f)
             if protein_seq_sample_limit is None:
@@ -497,90 +503,43 @@ class ProteinSeqDataset(Dataset):
             else:
                 self.protein_seq = [r.sequence for r in islice(records, protein_seq_sample_limit)]
 
+        
+        # self.protein_seq = [line.rstrip('\n') for line in open(os.path.join(self.data_dir, 'uniprot_sprot.dat'), 'r')]
         self.protein_seq = [trans_sequence(item) for item in self.protein_seq]
 
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
         self.sequence_lengths = [min(len(seq.split()), self.max_protein_seq_length) if self.max_protein_seq_length is not None else len(seq.split()) for seq in self.protein_seq]
         # self.protein_cor = pickle.load(open('./ProteinKG25/id2cor_dict.pkl', 'rb'))
-
-        # Load per-residue 3D coordinates if a coordinates pkl is provided.
-        # The pkl should be a dict mapping protein index -> List[List[float]] (one [x,y,z] per residue).
-        self.protein_cor = None
-        if coordinates_path is not None and os.path.exists(coordinates_path):
-            self.protein_cor = pickle.load(open(coordinates_path, 'rb'))
-
-        # Build aa_vec vocabulary if a mol2vec model is provided.
-        # The vocab maps token_id -> 300-dim embedding for each amino acid token.
-        self.aa_vocab = None
-        if aa_vec_model_path is not None and os.path.exists(aa_vec_model_path):
-            aa_smis = ['CC(N)C(=O)O', 'N=C(N)NCCCC(N)C(=O)O', 'NC(=O)CC(N)C(=O)O', 'NC(CC(=O)O)C(=O)O',
-                'NC(CS)C(=O)O', 'NC(CCC(=O)O)C(=O)O', 'NC(=O)CCC(N)C(=O)O', 'NCC(=O)O',
-                'NC(Cc1cnc[nH]1)C(=O)O', 'CCC(C)C(N)C(=O)O', 'CC(C)CC(N)C(=O)O', 'NCCCCC(N)C(=O)O',
-                'CSCCC(N)C(=O)O', 'NC(Cc1ccccc1)C(=O)O', 'O=C(O)C1CCCN1', 'NC(CO)C(=O)O',
-                'CC(O)C(N)C(=O)O', 'NC(Cc1c[nH]c2ccccc12)C(=O)O', 'NC(Cc1ccc(O)cc1)C(=O)O',
-                'CC(C)C(N)C(=O)O','CC1CC=NC1C(=O)NCCCCC(C(=O)O)N','C(C(C(=O)O)N)[Se]']
-            aa_codes = ['A', 'R', 'N', 'D', 'C', 'E', 'Q', 'G', 'H', 'I',
-                        'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', 'O', 'U', 'B', 'Z', 'X']
-            aa_idx_codes = dict(zip(aa_codes, range(len(aa_codes))))
-            aas = [Chem.MolFromSmiles(x) for x in aa_smis]
-            w2v_model = word2vec.Word2Vec.load(aa_vec_model_path)
-            aa_sentences = [mol2alt_sentence(x, 1) for x in aas]
-            aa_vecs = sentences2vec(aa_sentences, w2v_model, unseen='UNK')
-            B_vec = ((aa_vecs[aa_idx_codes['D']] + aa_vecs[aa_idx_codes['N']]) / 2).reshape(1, 300)
-            Z_vec = ((aa_vecs[aa_idx_codes['E']] + aa_vecs[aa_idx_codes['Q']]) / 2).reshape(1, 300)
-            aa_vecs = np.concatenate([aa_vecs, B_vec, Z_vec], axis=0)
-            X_vecs = np.mean(aa_vecs, axis=0).reshape(1, 300)
-            aa_vecs = np.concatenate([aa_vecs, X_vecs], axis=0)
-            self.aa_vocab = {}
-            for token, tok_id in self.tokenizer.get_vocab().items():
-                if token in aa_idx_codes:
-                    self.aa_vocab[tok_id] = {'aa': token, 'vec': list(aa_vecs[aa_idx_codes[token]])}
         
     def __getitem__(self, index):
+        # if self.in_memory and self.cache[index] is not None:
+        #     item = self.cache[index]
+        # else:
+        #     with self.env.begin(write=False) as txn:
+        #         item = pkl.loads(txn.get(str(index).encode()))
+        #     if self.in_memory:
+        #         self.cache[index] = item
         item = self.protein_seq[index]
 
-        # Truncate to max length before tokenizing so coordinates/aa_vec stay aligned
+        # implement padding of sequences at 'DataCollatorForLanguageModeling'
+        # item = list(item)
         if self.max_protein_seq_length is not None:
             tokens = item.split()[:self.max_protein_seq_length]
             item = " ".join(tokens)
-        raw_seq = item.replace(" ", "")  # amino acid characters without spaces
         input_ids = self.tokenizer.encode(item, add_special_tokens=True)
 
-        # --- 3D coordinates ---
-        cor = None
-        if self.protein_cor is not None and index in self.protein_cor:
-            cor = self.protein_cor[index]
-            if self.max_protein_seq_length is not None:
-                cor = cor[:self.max_protein_seq_length]
-            cor = np.array(cor, dtype=float)
-            if cor.any():
-                cor = (cor - cor.mean(axis=0)) / (cor.std(axis=0) + 1e-8)
-            cor = cor.tolist()
-        else:
-            # Fallback: zero coordinates matching the residue count (excluding CLS/SEP)
-            n_residues = len(input_ids) - 2  # subtract [CLS] and [SEP]
-            cor = np.zeros((max(n_residues, 0), 3)).tolist()
-
-        # --- aa_vec (mol2vec per residue) ---
-        aa_vec = None
-        if self.aa_vocab is not None:
-            aa_vec = []
-            aa_vec_padding = np.zeros(300).tolist()
-            for tok_id in input_ids[1:-1]:  # skip [CLS] and [SEP]
-                if tok_id in self.aa_vocab:
-                    aa_vec.append(self.aa_vocab[tok_id]['vec'])
-                else:
-                    aa_vec.append(aa_vec_padding)
-        else:
-            n_residues = len(input_ids) - 2
-            aa_vec = np.zeros((max(n_residues, 0), 300)).tolist()
+        # cor = self.protein_cor[index]
+        # if self.max_protein_seq_length is not None:
+        #     cor = cor[:self.max_protein_seq_length]
+        # ### coordinates normalize & padding
+        # cor = np.array(cor)-np.array(cor).mean(axis=0)
+        # cor = np.concatenate([np.zeros((1,3)),cor,np.zeros((1,3))],axis=0)
+        # cor = cor.tolist()
 
         return ProteinSeqInputFeatures(
             input_ids=input_ids,
-            coordinates=cor,
-            aa_vec=aa_vec,
-            sequence=raw_seq,
+            # coordinates=cor,
         )
         
     def __len__(self):
@@ -738,6 +697,7 @@ class ProteinSeqPairDataset(Dataset):
                 self.max_protein_seq_length,
             )
 
+
     def __len__(self) -> int:
         # each pair yields 2 examples (anchor then positive)
         return len(self.pairs) * 2
@@ -782,6 +742,46 @@ class ProteinSeqTripletInputFeatures:
     negative_id: Optional[str] = None
     positive_score: Optional[float] = None
     negative_score: Optional[float] = None
+    anchor_coordinates: Optional[List[List[float]]] = None
+    anchor_aa_vec: Optional[List[List[float]]] = None
+
+
+
+
+def _build_aa_vocab_from_mol2vec(model_path: str) -> Dict[str, List[float]]:
+    aa_smis = ['CC(N)C(=O)O', 'N=C(N)NCCCC(N)C(=O)O', 'NC(=O)CC(N)C(=O)O', 'NC(CC(=O)O)C(=O)O',
+        'NC(CS)C(=O)O', 'NC(CCC(=O)O)C(=O)O', 'NC(=O)CCC(N)C(=O)O', 'NCC(=O)O',
+        'NC(Cc1cnc[nH]1)C(=O)O', 'CCC(C)C(N)C(=O)O', 'CC(C)CC(N)C(=O)O', 'NCCCCC(N)C(=O)O',
+        'CSCCC(N)C(=O)O', 'NC(Cc1ccccc1)C(=O)O', 'O=C(O)C1CCCN1', 'NC(CO)C(=O)O',
+        'CC(O)C(N)C(=O)O', 'NC(Cc1c[nH]c2ccccc12)C(=O)O', 'NC(Cc1ccc(O)cc1)C(=O)O',
+        'CC(C)C(N)C(=O)O','CC1CC=NC1C(=O)NCCCCC(C(=O)O)N','C(C(C(=O)O)N)[Se]']
+    aa_codes = ['A', 'R', 'N', 'D', 'C', 'E', 'Q', 'G', 'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S', 'T', 'W', 'Y', 'V', 'O', 'U']
+    aas = [Chem.MolFromSmiles(x) for x in aa_smis]
+    model = word2vec.Word2Vec.load(model_path)
+    aa_sentences = [mol2alt_sentence(x, 1) for x in aas]
+    aa_vecs = sentences2vec(aa_sentences, model, unseen='UNK')
+    aa_vocab = {aa: aa_vecs[i].tolist() for i, aa in enumerate(aa_codes)}
+    aa_vocab['B'] = ((aa_vecs[aa_codes.index('D')] + aa_vecs[aa_codes.index('N')]) / 2.0).tolist()
+    aa_vocab['Z'] = ((aa_vecs[aa_codes.index('E')] + aa_vecs[aa_codes.index('Q')]) / 2.0).tolist()
+    aa_vocab['X'] = np.mean(np.asarray(list(aa_vocab.values()), dtype=np.float32), axis=0).tolist()
+    return aa_vocab
+
+
+def _extract_residue_token(token: str) -> Optional[str]:
+    if token is None:
+        return None
+    token = str(token).strip()
+    if not token:
+        return None
+    if token.startswith('##'):
+        token = token[2:]
+    if token.startswith('▁'):
+        token = token[1:]
+    if token.startswith('Ġ'):
+        token = token[1:]
+    if len(token) == 1 and token.isalpha():
+        return token.upper()
+    return None
 
 
 class ProteinSeqTripletDataset(Dataset):
@@ -800,6 +800,8 @@ class ProteinSeqTripletDataset(Dataset):
         tokenizer: PreTrainedTokenizerBase,
         max_protein_seq_length: Optional[int] = None,
         protein_seq_sample_limit: Optional[int] = None,
+        coordinates_path: Optional[str] = None,
+        aa_vec_model_path: Optional[str] = None,
     ):
         def trans_sequence(sequence: str) -> str:
             sequence = " ".join(sequence.strip())
@@ -809,6 +811,23 @@ class ProteinSeqTripletDataset(Dataset):
         self.triplets_tsv = triplets_tsv
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
+        self.coordinates_path = coordinates_path
+        self.aa_vec_model_path = aa_vec_model_path
+        self.protein_cor = None
+        self.aa_vocab = None
+        if coordinates_path is not None:
+            if not os.path.isabs(coordinates_path):
+                coordinates_path = os.path.join(self.data_dir, coordinates_path)
+            if not os.path.exists(coordinates_path):
+                raise FileNotFoundError(f"Coordinates file not found: {coordinates_path}")
+            with open(coordinates_path, 'rb') as f:
+                self.protein_cor = pickle.load(f)
+        if aa_vec_model_path is not None:
+            if not os.path.isabs(aa_vec_model_path):
+                aa_vec_model_path = os.path.join(self.data_dir, aa_vec_model_path)
+            if not os.path.exists(aa_vec_model_path):
+                raise FileNotFoundError(f"AA vec model not found: {aa_vec_model_path}")
+            self.aa_vocab = _build_aa_vocab_from_mol2vec(aa_vec_model_path)
         if not os.path.isabs(self.triplets_tsv):
             self.triplets_tsv = os.path.join(self.data_dir, self.triplets_tsv)
         if not os.path.exists(self.triplets_tsv):
@@ -866,10 +885,50 @@ class ProteinSeqTripletDataset(Dataset):
             self.triplets = self.triplets[:protein_seq_sample_limit]
         if len(self.triplets) == 0:
             raise ValueError("No triplets loaded from TSV")
+        self._validate_triplets_against_local_structure()
         self.example_lengths = [
             max(len(row['anchor_seq'].split()), len(row['positive_seq'].split()), len(row['negative_seq'].split()))
             for row in self.triplets
         ]
+
+    def _validate_triplets_against_local_structure(self) -> None:
+        if self.protein_cor is None:
+            return
+        missing_anchor_rows = [i for i, row in enumerate(self.triplets) if not row.get('anchor_id')]
+        if missing_anchor_rows:
+            preview = ', '.join(str(i) for i in missing_anchor_rows[:10])
+            raise ValueError(
+                f"coordinates_path requires anchor_id in every triplet row; missing in {len(missing_anchor_rows)} rows. First rows: {preview}"
+            )
+        unique_anchor_ids = sorted({row['anchor_id'] for row in self.triplets})
+        coord_keys = set(self.protein_cor.keys())
+        missing_anchor_ids = [anchor_id for anchor_id in unique_anchor_ids if anchor_id not in coord_keys]
+        if missing_anchor_ids:
+            preview = ', '.join(str(x) for x in missing_anchor_ids[:20])
+            raise ValueError(
+                "Coordinate PKL is missing anchor IDs required by the triplet TSV. "
+                f"Unique TSV anchors: {len(unique_anchor_ids)}; found in PKL: {len(unique_anchor_ids) - len(missing_anchor_ids)}; "
+                f"missing: {len(missing_anchor_ids)}. First missing IDs: {preview}"
+            )
+
+        sampled_warnings = []
+        sample_count = min(20, len(self.triplets))
+        for row in self.triplets[:sample_count]:
+            anchor_id = row['anchor_id']
+            seq_len = len(row['anchor_seq'].split())
+            coord_len = len(self.protein_cor[anchor_id]) if anchor_id in self.protein_cor else 0
+            if seq_len > 0 and coord_len > 0 and coord_len < max(1, int(0.5 * seq_len)):
+                sampled_warnings.append((anchor_id, seq_len, coord_len))
+        if sampled_warnings:
+            preview = '; '.join(f"{anchor_id}: seq={seq_len}, coords={coord_len}" for anchor_id, seq_len, coord_len in sampled_warnings[:5])
+            logger.warning("Triplet/local-structure sanity check found short coordinate entries for some anchors: %s", preview)
+
+        logger.info(
+            "Validated triplet/local-structure inputs: %d rows, %d unique anchors, coordinate coverage OK.",
+            len(self.triplets),
+            len(unique_anchor_ids),
+        )
+
     def __len__(self) -> int:
         return len(self.triplets)
 
@@ -878,19 +937,61 @@ class ProteinSeqTripletDataset(Dataset):
         if self.max_protein_seq_length is not None:
             return min(length, int(self.max_protein_seq_length))
         return length
+
     def _truncate(self, seq: str) -> str:
         if self.max_protein_seq_length is None:
             return seq
         return " ".join(seq.split()[: self.max_protein_seq_length])
+
+    def _build_coordinates(self, residue_count: int, protein_id: Optional[str]) -> List[List[float]]:
+        if residue_count <= 0:
+            return []
+        if self.protein_cor is None or protein_id is None:
+            return np.zeros((residue_count, 3), dtype=np.float32).tolist()
+        cor = self.protein_cor[protein_id]
+        cor = np.asarray(cor, dtype=np.float32)
+        if cor.ndim != 2 or cor.shape[1] != 3:
+            raise ValueError(f"Coordinates for {protein_id} must have shape [L,3]")
+        cor = cor[:residue_count]
+        if cor.shape[0] < residue_count:
+            pad = np.zeros((residue_count - cor.shape[0], 3), dtype=np.float32)
+            cor = np.concatenate([cor, pad], axis=0)
+        valid = np.any(np.abs(cor) > 0, axis=1)
+        if np.any(valid):
+            cor[valid] = cor[valid] - cor[valid].mean(axis=0, keepdims=True)
+        return cor.tolist()
+
+    def _build_aa_vec(self, input_ids: List[int], residue_count: int) -> List[List[float]]:
+        if residue_count <= 0:
+            return []
+        if self.aa_vocab is None:
+            return np.zeros((residue_count, 300), dtype=np.float32).tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+        aa_vec = []
+        for tok in tokens:
+            residue = _extract_residue_token(tok)
+            if residue is None:
+                continue
+            aa_vec.append(self.aa_vocab.get(residue, self.aa_vocab['X']))
+            if len(aa_vec) == residue_count:
+                break
+        if len(aa_vec) < residue_count:
+            aa_vec.extend([self.aa_vocab['X']] * (residue_count - len(aa_vec)))
+        return np.asarray(aa_vec[:residue_count], dtype=np.float32).tolist()
+
     def __getitem__(self, index: int) -> ProteinSeqTripletInputFeatures:
         row = self.triplets[index]
         anchor_seq = self._truncate(row["anchor_seq"])
         positive_seq = self._truncate(row["positive_seq"])
         negative_seq = self._truncate(row["negative_seq"])
+        anchor_input_ids = self.tokenizer.encode(anchor_seq, add_special_tokens=True)
+        positive_input_ids = self.tokenizer.encode(positive_seq, add_special_tokens=True)
+        negative_input_ids = self.tokenizer.encode(negative_seq, add_special_tokens=True)
+        residue_count = max(len(anchor_input_ids) - 2, 0)
         return ProteinSeqTripletInputFeatures(
-            anchor_input_ids=self.tokenizer.encode(anchor_seq, add_special_tokens=True),
-            positive_input_ids=self.tokenizer.encode(positive_seq, add_special_tokens=True),
-            negative_input_ids=self.tokenizer.encode(negative_seq, add_special_tokens=True),
+            anchor_input_ids=anchor_input_ids,
+            positive_input_ids=positive_input_ids,
+            negative_input_ids=negative_input_ids,
             anchor_sequence=anchor_seq,
             positive_sequence=positive_seq,
             negative_sequence=negative_seq,
@@ -899,6 +1000,8 @@ class ProteinSeqTripletDataset(Dataset):
             negative_id=row.get("negative_id"),
             positive_score=row.get("positive_score"),
             negative_score=row.get("negative_score"),
+            anchor_coordinates=self._build_coordinates(residue_count, row.get('anchor_id')),
+            anchor_aa_vec=self._build_aa_vec(anchor_input_ids, residue_count),
         )
 
 class GoGoDataset(Dataset):
