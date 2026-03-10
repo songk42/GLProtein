@@ -46,6 +46,20 @@ from typing import Any
 
 import numpy as np
 
+
+def _ensure_local_module_path() -> None:
+    current_dir = Path(__file__).resolve().parent
+    candidate_dirs = [
+        current_dir,
+        current_dir.parent / 'src_refactor',
+    ]
+    for candidate in candidate_dirs:
+        if candidate.is_dir() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+
+
+_ensure_local_module_path()
+
 from coordinate_store import (
     export_coordinate_shards_from_temp_shards,
     normalize_coordinate_array,
@@ -317,6 +331,43 @@ def config_fingerprint(
     }
 
 
+
+def _existing_shard_names(shard_dir: Path) -> list[str]:
+    if not shard_dir.exists():
+        return []
+    shard_names = [child.name for child in shard_dir.iterdir() if child.is_file() and child.name.startswith('shard_') and child.suffix == '.pkl']
+    return sorted(shard_names)
+
+
+def _next_shard_index(shard_paths: list[str], shard_dir: Path) -> int:
+    max_index = 0
+    for shard_name in list(shard_paths) + _existing_shard_names(shard_dir):
+        try:
+            stem = Path(shard_name).stem
+            idx = int(stem.split('_')[-1])
+            max_index = max(max_index, idx)
+        except Exception:
+            continue
+    return max_index + 1
+
+
+def reconcile_shard_paths(shard_dir: Path, shard_paths: list[str], *, context: str) -> list[str]:
+    existing = _existing_shard_names(shard_dir)
+    if not shard_paths:
+        return existing
+    missing = [name for name in shard_paths if name not in existing]
+    if not missing:
+        return shard_paths
+    if not existing:
+        raise FileNotFoundError(
+            f"{context} references missing shard files and no shard files remain on disk. First missing shard: {shard_dir / missing[0]}"
+        )
+    print(
+        f"[warn] {context} references {len(missing)} missing shard file(s); falling back to the {len(existing)} shard file(s) currently present in {shard_dir}. First missing shard: {shard_dir / missing[0]}"
+    )
+    return existing
+
+
 def flush_buffer_to_shard(
     shard_dir: Path,
     buffer_result: dict[Any, np.ndarray],
@@ -325,7 +376,8 @@ def flush_buffer_to_shard(
     if not buffer_result:
         return None
     shard_dir.mkdir(parents=True, exist_ok=True)
-    shard_name = f"shard_{len(shard_paths) + 1:06d}.pkl"
+    next_index = _next_shard_index(shard_paths, shard_dir)
+    shard_name = f"shard_{next_index:06d}.pkl"
     shard_path = shard_dir / shard_name
     save_pickle_atomic(shard_path, buffer_result)
     shard_paths.append(shard_name)
@@ -616,11 +668,7 @@ def main():
         saved_new = int(state.get("saved_new", 0))
         overwritten = int(state.get("overwritten", 0))
         overwrite_examples = list(state.get("overwrite_examples", []))
-        shard_paths = list(state.get("shard_paths", []))
-        for shard_name in shard_paths:
-            shard_path = shard_dir / shard_name
-            if not shard_path.exists():
-                raise FileNotFoundError(f"Checkpoint references missing shard file: {shard_path}")
+        shard_paths = reconcile_shard_paths(shard_dir, list(state.get("shard_paths", [])), context='Checkpoint')
         if allowed_anchor_ids is not None:
             anchors_extracted_successfully = {key for key in seen_keys if key in allowed_anchor_ids}
         print(
@@ -771,6 +819,7 @@ def main():
         f"skipped={skipped} failed={len(failed)} | shards={len(shard_paths)} | elapsed={elapsed:.1f}s"
     )
 
+    shard_paths = reconcile_shard_paths(shard_dir, shard_paths, context='Final export')
     unique_key_count, index_path = finalize_output(
         output_format=args.output_format,
         shard_dir=shard_dir,

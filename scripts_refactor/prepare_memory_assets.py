@@ -2,9 +2,25 @@ import argparse
 import json
 import os
 import pickle
+import sys
+from pathlib import Path
 from typing import Dict, Any
 
 import numpy as np
+
+
+def _ensure_local_module_path() -> None:
+    current_dir = Path(__file__).resolve().parent
+    candidate_dirs = [
+        current_dir,
+        current_dir.parent / 'src_refactor',
+    ]
+    for candidate in candidate_dirs:
+        if candidate.is_dir() and str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+
+
+_ensure_local_module_path()
 
 from coordinate_store import export_coordinate_shards_from_mapping
 
@@ -18,6 +34,7 @@ def export_coordinate_shards(input_pkl: str, output_dir: str, fmt: str = 'npy') 
 
 
 def export_aa_vocab(mol2vec_model_path: str, output_path: str) -> None:
+    _ensure_local_module_path()
     from dataset import _build_aa_vocab_from_mol2vec
 
     aa_vocab = _build_aa_vocab_from_mol2vec(mol2vec_model_path)

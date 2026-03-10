@@ -61,6 +61,13 @@ def export_coordinate_shards_from_mapping(payload: CoordinateMap, output_dir: st
     return count, index_path
 
 
+
+def _list_existing_temp_shards(temp_shard_dir: Path) -> list[str]:
+    if not temp_shard_dir.exists():
+        return []
+    return sorted([child.name for child in temp_shard_dir.iterdir() if child.is_file() and child.name.startswith('shard_') and child.suffix == '.pkl'])
+
+
 def export_coordinate_shards_from_temp_shards(
     temp_shard_dir: str | os.PathLike[str],
     shard_paths: Iterable[str],
@@ -77,6 +84,15 @@ def export_coordinate_shards_from_temp_shards(
     index: Dict[str, str] = {}
     count = 0
     temp_shard_dir = Path(temp_shard_dir)
+    shard_paths = list(shard_paths)
+    existing_shards = _list_existing_temp_shards(temp_shard_dir)
+    missing = [name for name in shard_paths if name not in existing_shards]
+    if missing:
+        if not existing_shards:
+            raise FileNotFoundError(f"Expected shard file missing during final export: {temp_shard_dir / missing[0]}")
+        shard_paths = existing_shards
+    elif not shard_paths:
+        shard_paths = existing_shards
     for shard_name in shard_paths:
         shard_path = temp_shard_dir / shard_name
         if not shard_path.exists():
