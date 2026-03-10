@@ -20,7 +20,7 @@ import pickle
 import numpy as np
 import math as m
 from gensim.models import word2vec
-from mol2vec.features import mol2alt_sentence, MolSentence, DfVec, sentences2vec
+from mol2vec.features import mol2alt_sentence
 from rdkit import Chem
 import re
 from transformers import T5Tokenizer
@@ -33,6 +33,30 @@ from itertools import islice
 
 
 logger = logging.getLogger(__name__)
+
+
+def _sentences2vec_gensim4(sentences, model, unseen: str = 'UNK') -> np.ndarray:
+    """Gensim-4-compatible replacement for mol2vec.features.sentences2vec."""
+    wv = model.wv
+    vector_size = int(wv.vector_size)
+    fallback = wv[unseen] if unseen in wv.key_to_index else np.zeros(vector_size, dtype=np.float32)
+
+    sentence_vectors = []
+    for sentence in sentences:
+        token_vectors = []
+        for token in sentence:
+            if token in wv.key_to_index:
+                token_vectors.append(np.asarray(wv[token], dtype=np.float32))
+            else:
+                token_vectors.append(np.asarray(fallback, dtype=np.float32))
+        if token_vectors:
+            sentence_vec = np.sum(np.stack(token_vectors, axis=0), axis=0, dtype=np.float32)
+        else:
+            sentence_vec = np.zeros(vector_size, dtype=np.float32)
+        sentence_vectors.append(sentence_vec.astype(np.float32, copy=False))
+
+    return np.stack(sentence_vectors, axis=0).astype(np.float32, copy=False)
+
 def _sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -279,7 +303,7 @@ class ProteinGoDataset(Dataset):
         model = word2vec.Word2Vec.load('./src/model_300dim.pkl')
         aa_sentences = [mol2alt_sentence(x, 1) for x in aas]
 
-        aa_vecs = sentences2vec(aa_sentences, model, unseen='UNK')
+        aa_vecs = _sentences2vec_gensim4(aa_sentences, model, unseen='UNK')
 
         B_vec = (aa_vecs[aa_idx_codes['D']] + aa_vecs[aa_idx_codes['N']])/2
         B_vec = B_vec.reshape(1,300)
@@ -759,11 +783,21 @@ def _build_aa_vocab_from_mol2vec(model_path: str) -> Dict[str, List[float]]:
     aas = [Chem.MolFromSmiles(x) for x in aa_smis]
     model = word2vec.Word2Vec.load(model_path)
     aa_sentences = [mol2alt_sentence(x, 1) for x in aas]
-    aa_vecs = sentences2vec(aa_sentences, model, unseen='UNK')
+    aa_vecs = _sentences2vec_gensim4(aa_sentences, model, unseen='UNK')
+    if aa_vecs.ndim != 2 or aa_vecs.shape[0] != len(aa_codes):
+        raise ValueError(
+            f"Unexpected amino-acid mol2vec shape from {model_path}: got {aa_vecs.shape}, expected ({len(aa_codes)}, vector_dim)"
+        )
     aa_vocab = {aa: aa_vecs[i].tolist() for i, aa in enumerate(aa_codes)}
     aa_vocab['B'] = ((aa_vecs[aa_codes.index('D')] + aa_vecs[aa_codes.index('N')]) / 2.0).tolist()
     aa_vocab['Z'] = ((aa_vecs[aa_codes.index('E')] + aa_vecs[aa_codes.index('Q')]) / 2.0).tolist()
     aa_vocab['X'] = np.mean(np.asarray(list(aa_vocab.values()), dtype=np.float32), axis=0).tolist()
+    logger.info(
+        "Loaded mol2vec amino-acid vocabulary from %s with %d residue codes and vector dim %d",
+        model_path,
+        len(aa_vocab),
+        int(aa_vecs.shape[1]),
+    )
     return aa_vocab
 
 

@@ -5,13 +5,12 @@ GLProtein dataset.
 
 Output formats:
     TSV-ID-compatible mode:
-        dict[str, list[list[float]]]
-        {raw_fasta_id_token: [[x, y, z], ...]}
+        dict[str, numpy.ndarray]
+        {raw_fasta_id_token: float32 array of shape [L, 3]}
 
     Legacy integer-keyed mode:
-        dict[int, list[list[float]]]
-        {protein_index: [[x, y, z], ...]}
-
+        dict[int, numpy.ndarray]
+        {protein_index: float32 array of shape [L, 3]}
 
 When `--key-mode tsv_id` is used, the extractor reads the FASTA headers and
 maps AlphaFold/structure accessions back to the raw FASTA ID tokens written by
@@ -32,7 +31,9 @@ Usage:
 """
 
 import argparse
+import gc
 import gzip
+import hashlib
 import io
 import os
 import pickle
@@ -41,6 +42,8 @@ import warnings
 import time
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 # Suppress noisy BioPython warnings (e.g. discontinuous chains)
 warnings.filterwarnings("ignore")
@@ -104,7 +107,7 @@ def read_triplet_anchor_ids(path: Path) -> set[str]:
 
     anchor_ids: set[str] = set()
     with open(path, "r", encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh, delimiter="	")
+        reader = csv.DictReader(fh, delimiter="\t")
         if reader.fieldnames is None or "anchor_id" not in reader.fieldnames:
             raise ValueError(f"Triplet TSV {path} must contain an 'anchor_id' column")
         for row_idx, row in enumerate(reader, start=2):
@@ -122,17 +125,8 @@ def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = Non
 
     Only standard amino acid residues are included (ATOM records / type=
     'polypeptide' residues); HETATM ligands/waters are skipped.
-
-    Parameters
-    ----------
-    path       : Path to the structure file.
-    model_idx  : Which MODEL to use (0-indexed).  AlphaFold files have one model.
-    chain_id   : If given, restrict to this chain; otherwise use all chains.
     """
-    if _is_cif(path):
-        parser = MMCIFParser(QUIET=True)
-    else:
-        parser = PDBParser(QUIET=True)
+    parser = MMCIFParser(QUIET=True) if _is_cif(path) else PDBParser(QUIET=True)
 
     with _open_file(path) as fh:
         content = fh.read()
@@ -141,10 +135,10 @@ def extract_ca_coords(path: Path, model_idx: int = 0, chain_id: str | None = Non
 
     try:
         model = list(structure.get_models())[model_idx]
-    except IndexError:
-        raise ValueError(f"{path}: model index {model_idx} out of range")
+    except IndexError as exc:
+        raise ValueError(f"{path}: model index {model_idx} out of range") from exc
 
-    coords = []
+    coords: list[list[float]] = []
     for chain in model.get_chains():
         if chain_id is not None and chain.id != chain_id:
             continue
@@ -254,12 +248,20 @@ def default_checkpoint_path(output_path: Path) -> Path:
     return Path(str(output_path) + ".checkpoint.pkl")
 
 
-def save_checkpoint(checkpoint_path: Path, state: dict[str, Any]) -> None:
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+def default_shard_dir(output_path: Path) -> Path:
+    return Path(str(output_path) + ".shards")
+
+
+def save_pickle_atomic(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
     with open(tmp_path, "wb") as fh:
-        pickle.dump(state, fh)
-    os.replace(tmp_path, checkpoint_path)
+        pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def save_checkpoint(checkpoint_path: Path, state: dict[str, Any]) -> None:
+    save_pickle_atomic(checkpoint_path, state)
 
 
 def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
@@ -270,34 +272,123 @@ def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
     return state
 
 
+def normalize_coords(coords: list[list[float]]) -> np.ndarray:
+    arr = np.asarray(coords, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"Coordinates must have shape [L,3], got {arr.shape}")
+    return arr
+
+
+def compute_candidate_hash(files: list[Path]) -> str:
+    h = hashlib.sha256()
+    for path in files:
+        h.update(path.name.encode("utf-8", errors="replace"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def config_fingerprint(
+    args: argparse.Namespace,
+    total_found: int,
+    total_candidate_files: int,
+    pre_skipped: int,
+    pre_skipped_not_in_anchors: int,
+    dedup_dropped: int,
+    candidate_hash: str,
+) -> dict[str, Any]:
+    return {
+        "input_dir": str(args.input_dir.resolve()),
+        "output": str(args.output.resolve()),
+        "key_mode": args.key_mode,
+        "fasta": str(args.fasta.resolve()) if args.fasta else None,
+        "triplets_tsv": str(args.triplets_tsv.resolve()) if args.triplets_tsv else None,
+        "index_map": str(args.index_map.resolve()) if args.index_map else None,
+        "chain": args.chain,
+        "model": int(args.model),
+        "total_found": int(total_found),
+        "total_candidate_files": int(total_candidate_files),
+        "pre_skipped": int(pre_skipped),
+        "pre_skipped_not_in_anchors": int(pre_skipped_not_in_anchors),
+        "dedup_dropped": int(dedup_dropped),
+        "candidate_hash": candidate_hash,
+    }
+
+
+def flush_buffer_to_shard(
+    shard_dir: Path,
+    buffer_result: dict[Any, np.ndarray],
+    shard_paths: list[str],
+) -> str | None:
+    if not buffer_result:
+        return None
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_name = f"shard_{len(shard_paths) + 1:06d}.pkl"
+    shard_path = shard_dir / shard_name
+    save_pickle_atomic(shard_path, buffer_result)
+    shard_paths.append(shard_name)
+    buffer_result.clear()
+    gc.collect()
+    return shard_name
+
+
 def checkpoint_state(
-    result: dict[Any, list[list[float]]],
+    *,
     processed_files: set[str],
+    seen_keys: set[Any],
     failed: list[str],
     skipped: int,
     saved_new: int,
     overwritten: int,
     overwrite_examples: list[str],
-    total_candidate_files: int,
-    pre_skipped: int,
-    pre_skipped_not_in_anchors: int,
-    dedup_dropped: int,
+    shard_paths: list[str],
+    buffer_result: dict[Any, np.ndarray],
+    fingerprint: dict[str, Any],
     started_at: float,
 ) -> dict[str, Any]:
     return {
-        "result": result,
         "processed_files": sorted(processed_files),
+        "seen_keys": list(seen_keys),
         "failed": list(failed),
         "skipped": int(skipped),
         "saved_new": int(saved_new),
         "overwritten": int(overwritten),
-        "overwrite_examples": list(overwrite_examples),
-        "total_candidate_files": int(total_candidate_files),
-        "pre_skipped": int(pre_skipped),
-        "pre_skipped_not_in_anchors": int(pre_skipped_not_in_anchors),
-        "dedup_dropped": int(dedup_dropped),
+        "overwrite_examples": list(overwrite_examples[:10]),
+        "shard_paths": list(shard_paths),
+        "buffer_result": dict(buffer_result),
+        "fingerprint": fingerprint,
         "started_at": float(started_at),
     }
+
+
+def merge_shards_to_output(shard_dir: Path, shard_paths: list[str], buffer_result: dict[Any, np.ndarray], output_path: Path) -> int:
+    final_result: dict[Any, np.ndarray] = {}
+    for shard_name in shard_paths:
+        shard_path = shard_dir / shard_name
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Expected shard file missing during final merge: {shard_path}")
+        with open(shard_path, "rb") as fh:
+            shard_data = pickle.load(fh)
+        if not isinstance(shard_data, dict):
+            raise ValueError(f"Shard {shard_path} does not contain a dict")
+        final_result.update(shard_data)
+        del shard_data
+    if buffer_result:
+        final_result.update(buffer_result)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    save_pickle_atomic(output_path, final_result)
+    count = len(final_result)
+    del final_result
+    gc.collect()
+    return count
+
+
+def remove_shard_dir(shard_dir: Path) -> None:
+    if not shard_dir.exists():
+        return
+    for child in shard_dir.iterdir():
+        if child.is_file():
+            child.unlink()
+    shard_dir.rmdir()
 
 
 def main():
@@ -350,8 +441,20 @@ def main():
     parser.add_argument(
         "--save-every",
         type=int,
-        default=5000,
+        default=2000,
         help="Save resume checkpoint every N newly processed candidate files (default: 5000)",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=2000,
+        help="Flush buffered coordinate records to a shard every N newly saved keys (default: 2000)",
+    )
+    parser.add_argument(
+        "--shard-dir",
+        type=Path,
+        default=None,
+        help="Directory for temporary shard files. Defaults to <output>.shards",
     )
     args = parser.parse_args()
 
@@ -361,6 +464,8 @@ def main():
         sys.exit("--save-every must be > 0")
     if args.log_every <= 0:
         sys.exit("--log-every must be > 0")
+    if args.flush_every <= 0:
+        sys.exit("--flush-every must be > 0")
 
     files = collect_structure_files(args.input_dir)
     if not files:
@@ -406,7 +511,7 @@ def main():
         )
         files, dedup_dropped, dedup_examples = dedupe_tsv_files(files)
         print(
-            f"[info] deduplicated candidate files by accession: {total_found - pre_skipped} -> {len(files)} "
+            f"[info] deduplicated candidate files by accession: {total_found - pre_skipped - pre_skipped_not_in_anchors} -> {len(files)} "
             f"(dropped {dedup_dropped})"
         )
         if dedup_examples:
@@ -415,61 +520,87 @@ def main():
     index_map = load_index_map(args.index_map) if args.index_map else None
 
     total_candidate_files = len(files)
+    candidate_hash = compute_candidate_hash(files)
     checkpoint_path = args.checkpoint_path or default_checkpoint_path(args.output)
+    shard_dir = args.shard_dir or default_shard_dir(args.output)
+    fingerprint = config_fingerprint(
+        args=args,
+        total_found=total_found,
+        total_candidate_files=total_candidate_files,
+        pre_skipped=pre_skipped,
+        pre_skipped_not_in_anchors=pre_skipped_not_in_anchors,
+        dedup_dropped=dedup_dropped,
+        candidate_hash=candidate_hash,
+    )
 
-    result: dict[Any, list[list[float]]] = {}
+    buffer_result: dict[Any, np.ndarray] = {}
     failed: list[str] = []
     skipped = 0
     saved_new = 0
     overwritten = 0
     overwrite_examples: list[str] = []
     processed_files: set[str] = set()
+    seen_keys: set[Any] = set()
+    shard_paths: list[str] = []
     started_at = time.time()
 
-    if args.resume:
-        if checkpoint_path.exists():
-            state = load_checkpoint(checkpoint_path)
-            result = state.get("result", {})
-            processed_files = set(state.get("processed_files", []))
-            failed = list(state.get("failed", []))
-            skipped = int(state.get("skipped", 0))
-            saved_new = int(state.get("saved_new", len(result)))
-            overwritten = int(state.get("overwritten", 0))
-            overwrite_examples = list(state.get("overwrite_examples", []))
-            ck_total_candidate = state.get("total_candidate_files")
-            ck_pre_skipped = state.get("pre_skipped")
-            ck_pre_skipped_not_in_anchors = state.get("pre_skipped_not_in_anchors")
-            ck_dedup_dropped = state.get("dedup_dropped")
-            if ck_total_candidate is not None and int(ck_total_candidate) != total_candidate_files:
-                print(
-                    f"[warn] checkpoint candidate file count {ck_total_candidate} differs from current {total_candidate_files}; continuing with current file list"
-                )
-            if ck_pre_skipped is not None and int(ck_pre_skipped) != pre_skipped:
-                print(
-                    f"[warn] checkpoint pre-skipped count {ck_pre_skipped} differs from current {pre_skipped}; continuing with current file list"
-                )
-            if ck_pre_skipped_not_in_anchors is not None and int(ck_pre_skipped_not_in_anchors) != pre_skipped_not_in_anchors:
-                print(
-                    f"[warn] checkpoint anchor-prefilter count {ck_pre_skipped_not_in_anchors} differs from current {pre_skipped_not_in_anchors}; continuing with current file list"
-                )
-            if ck_dedup_dropped is not None and int(ck_dedup_dropped) != dedup_dropped:
-                print(
-                    f"[warn] checkpoint dedup-dropped count {ck_dedup_dropped} differs from current {dedup_dropped}; continuing with current file list"
-                )
-            print(
-                f"[resume] loaded checkpoint {checkpoint_path} | processed={len(processed_files)}/{total_candidate_files} "
-                f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)}"
+    if args.resume and checkpoint_path.exists():
+        state = load_checkpoint(checkpoint_path)
+        checkpoint_fingerprint = state.get("fingerprint")
+        if checkpoint_fingerprint != fingerprint:
+            raise ValueError(
+                "Checkpoint configuration does not match the current run. "
+                f"Checkpoint fingerprint: {checkpoint_fingerprint}; current fingerprint: {fingerprint}"
             )
-        else:
-            print(f"[resume] no checkpoint found at {checkpoint_path}; starting fresh")
+        buffer_result = dict(state.get("buffer_result", {}))
+        processed_files = set(state.get("processed_files", []))
+        seen_keys = set(state.get("seen_keys", []))
+        failed = list(state.get("failed", []))
+        skipped = int(state.get("skipped", 0))
+        saved_new = int(state.get("saved_new", 0))
+        overwritten = int(state.get("overwritten", 0))
+        overwrite_examples = list(state.get("overwrite_examples", []))
+        shard_paths = list(state.get("shard_paths", []))
+        for shard_name in shard_paths:
+            shard_path = shard_dir / shard_name
+            if not shard_path.exists():
+                raise FileNotFoundError(f"Checkpoint references missing shard file: {shard_path}")
+        print(
+            f"[resume] loaded checkpoint {checkpoint_path} | processed={len(processed_files)}/{total_candidate_files} "
+            f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)} "
+            f"buffered={len(buffer_result)} shards={len(shard_paths)}"
+        )
+    elif args.resume:
+        print(f"[resume] no checkpoint found at {checkpoint_path}; starting fresh")
+
+    if not checkpoint_path.exists():
+        save_checkpoint(
+            checkpoint_path,
+            checkpoint_state(
+                processed_files=processed_files,
+                seen_keys=seen_keys,
+                failed=failed,
+                skipped=skipped,
+                saved_new=saved_new,
+                overwritten=overwritten,
+                overwrite_examples=overwrite_examples,
+                shard_paths=shard_paths,
+                buffer_result=buffer_result,
+                fingerprint=fingerprint,
+                started_at=started_at,
+            ),
+        )
+        print(f"[checkpoint] initialized checkpoint at {checkpoint_path}")
 
     last_checkpoint_processed = len(processed_files)
+    last_flush_saved_total = saved_new + overwritten
 
     for loop_idx, path in enumerate(files):
         file_token = path.name
         if file_token in processed_files:
             continue
 
+        protein_key: Any
         if args.key_mode == "index":
             if index_map is not None:
                 stem = path.name.removesuffix(".gz")
@@ -478,6 +609,7 @@ def main():
                     print(f"  [skip] {path.name}: stem '{stem}' not in index map")
                     skipped += 1
                     processed_files.add(file_token)
+                    protein_key = None
                 else:
                     protein_key = index_map[stem]
             else:
@@ -488,12 +620,11 @@ def main():
                 print(f"  [skip] {path.name}: accession '{accession}' not in FASTA map")
                 skipped += 1
                 processed_files.add(file_token)
+                protein_key = None
             else:
                 protein_key = accession_to_tsv_id[accession]
 
-        if file_token in processed_files:
-            pass
-        else:
+        if file_token not in processed_files:
             try:
                 coords = extract_ca_coords(path, model_idx=args.model, chain_id=args.chain)
             except Exception as e:
@@ -506,45 +637,55 @@ def main():
                     failed.append(path.name)
                     processed_files.add(file_token)
                 else:
-                    if protein_key in result:
+                    coords_arr = normalize_coords(coords)
+                    if protein_key in seen_keys:
                         overwritten += 1
                         if len(overwrite_examples) < 10:
                             overwrite_examples.append(f"{path.name} -> {protein_key}")
                     else:
                         saved_new += 1
-                    result[protein_key] = coords
+                        seen_keys.add(protein_key)
+                    buffer_result[protein_key] = coords_arr
                     processed_files.add(file_token)
                     if saved_new + overwritten <= 10:
-                        print(f"  [{protein_key}] {path.name}: {len(coords)} residues")
+                        print(f"  [{protein_key}] {path.name}: {coords_arr.shape[0]} residues")
 
         processed_count = len(processed_files)
         if processed_count == 0:
             continue
 
         newly_processed_since_save = processed_count - last_checkpoint_processed
+        buffered_saved_total = saved_new + overwritten
+        newly_saved_since_flush = buffered_saved_total - last_flush_saved_total
+
         if processed_count == 1 or (processed_count % args.log_every == 0):
             elapsed = time.time() - started_at
             rate = processed_count / elapsed if elapsed > 0 else 0.0
             print(
                 f"[progress] processed {processed_count}/{total_candidate_files} candidate files | "
-                f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)} | "
+                f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)} buffered={len(buffer_result)} shards={len(shard_paths)} | "
                 f"elapsed={elapsed:.1f}s rate={rate:.2f} files/s"
             )
+        if newly_saved_since_flush >= args.flush_every and buffer_result:
+            shard_name = flush_buffer_to_shard(shard_dir, buffer_result, shard_paths)
+            print(
+                f"[flush] wrote shard {shard_name} to {shard_dir} at processed={processed_count} | total shards={len(shard_paths)}"
+            )
+            last_flush_saved_total = saved_new + overwritten
         if newly_processed_since_save >= args.save_every:
             save_checkpoint(
                 checkpoint_path,
                 checkpoint_state(
-                    result=result,
                     processed_files=processed_files,
+                    seen_keys=seen_keys,
                     failed=failed,
                     skipped=skipped,
                     saved_new=saved_new,
                     overwritten=overwritten,
                     overwrite_examples=overwrite_examples,
-                    total_candidate_files=total_candidate_files,
-                    pre_skipped=pre_skipped,
-                    pre_skipped_not_in_anchors=pre_skipped_not_in_anchors,
-                    dedup_dropped=dedup_dropped,
+                    shard_paths=shard_paths,
+                    buffer_result=buffer_result,
+                    fingerprint=fingerprint,
                     started_at=started_at,
                 ),
             )
@@ -559,17 +700,19 @@ def main():
             f"({processed_count} != {saved_new} + {overwritten} + {skipped} + {len(failed)})"
         )
 
+    if buffer_result:
+        shard_name = flush_buffer_to_shard(shard_dir, buffer_result, shard_paths)
+        print(f"[flush] wrote final shard {shard_name} to {shard_dir}")
+        last_flush_saved_total = saved_new + overwritten
+
     print(
         f"[done] total_found={total_found} | pre_skipped_not_in_fasta={pre_skipped} | pre_skipped_not_in_anchors={pre_skipped_not_in_anchors} | dedup_dropped={dedup_dropped} | "
         f"processed={processed_count}/{total_candidate_files} | saved_new={saved_new} overwritten={overwritten} "
-        f"skipped={skipped} failed={len(failed)} | unique_keys={len(result)} | elapsed={elapsed:.1f}s"
+        f"skipped={skipped} failed={len(failed)} | shards={len(shard_paths)} | elapsed={elapsed:.1f}s"
     )
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "wb") as fh:
-        pickle.dump(result, fh)
-
-    print(f"\nSaved {len(result)} unique protein keys -> {args.output}")
+    unique_key_count = merge_shards_to_output(shard_dir, shard_paths, buffer_result, args.output)
+    print(f"\nSaved {unique_key_count} unique protein keys -> {args.output}")
     if overwrite_examples:
         print("Overwrite examples: " + "; ".join(overwrite_examples[:10]))
     if failed:
@@ -578,6 +721,11 @@ def main():
     if checkpoint_path.exists():
         checkpoint_path.unlink()
         print(f"[cleanup] removed checkpoint file {checkpoint_path}")
+    remove_shard_dir(shard_dir)
+    if shard_dir.exists():
+        print(f"[warn] shard directory not fully removed: {shard_dir}")
+    else:
+        print(f"[cleanup] removed shard directory {shard_dir}")
 
 
 if __name__ == "__main__":
