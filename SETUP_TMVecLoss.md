@@ -115,18 +115,17 @@ python run_pretrain_refactor.py \
   --lm_learning_rate 1e-5 \
   --lm_warmup_ratio 0.167 \
   --fp16 \
-  --dataloader_pin_memory \
   --seed 2021 \
   --per_device_train_batch_size 2 \
   --logging_steps 1 \
-  --save_steps 10 \
-  --max_steps 30 \
+  --save_steps 4 \
+  --max_steps 8 \
   --gradient_accumulation_steps 2 \
   --gradient_checkpointing True \
   --triplet_microbatch_size 1 \
   --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
-  --save_total_limit 3 \
+  --save_total_limit 2 \
   --filter_triplets_to_coordinate_coverage True \
   --auto_resume_from_latest True
 ```
@@ -187,11 +186,10 @@ python run_pretrain_refactor.py \
   --lm_learning_rate 1e-5 \
   --lm_warmup_ratio 0.167 \
   --fp16 \
-  --dataloader_pin_memory \
   --seed 2021 \
   --per_device_train_batch_size 2 \
   --logging_steps 50 \
-  --save_steps 2500 \
+  --save_steps 1000 \
   --max_steps 300000 \
   --gradient_accumulation_steps 2 \
   --gradient_checkpointing True \

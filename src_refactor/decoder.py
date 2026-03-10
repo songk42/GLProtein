@@ -785,11 +785,14 @@ class KnowledgeBertModel(BertPreTrainedModel):
         # head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         extended_attention_mask = None
+        # Transformers get_extended_attention_mask signature differs across versions
         if attention_mask is not None:
-            extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape, device)
+            extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
         extended_aa_vec_attention_mask = None
         if aa_vec_attention_mask is not None:
-            extended_aa_vec_attention_mask = self.get_extended_attention_mask(aa_vec_attention_mask, aa_vec_attention_mask.size(), device)
+            # aa_vec_attention_mask must broadcast as [batch, 1, 1, key_len] instead of a square self-attention mask.
+            extended_aa_vec_attention_mask = aa_vec_attention_mask[:, None, None, :].to(dtype=self.dtype)
+            extended_aa_vec_attention_mask = (1.0 - extended_aa_vec_attention_mask) * -10000.0
 
         embedding_output = self.embeddings(
             input_ids=input_ids,

@@ -461,13 +461,13 @@ def main():
     parser.add_argument(
         "--save-every",
         type=int,
-        default=2000,
+        default=5000,
         help="Save resume checkpoint every N newly processed candidate files (default: 5000)",
     )
     parser.add_argument(
         "--flush-every",
         type=int,
-        default=2000,
+        default=5000,
         help="Flush buffered coordinate records to a shard every N newly saved keys (default: 2000)",
     )
     parser.add_argument(
