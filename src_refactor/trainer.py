@@ -349,7 +349,11 @@ class GLProteinTrainer(Trainer):
         rng_path = os.path.join(checkpoint_dir, 'rng_state.pth')
         if not os.path.exists(rng_path):
             return
-        rng_state = torch.load(rng_path, map_location='cpu')
+        try:
+            rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            # Older PyTorch versions do not support weights_only.
+            rng_state = torch.load(rng_path, map_location='cpu')
         random.setstate(rng_state['python'])
         np.random.set_state(rng_state['numpy'])
         torch.set_rng_state(rng_state['torch'])
