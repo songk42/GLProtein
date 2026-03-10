@@ -35,6 +35,7 @@ import gc
 import gzip
 import hashlib
 import io
+import json
 import os
 import pickle
 import sys
@@ -206,10 +207,11 @@ def prefilter_tsv_files(
     files: list[Path],
     accession_to_tsv_id: dict[str, str],
     allowed_tsv_ids: set[str] | None = None,
-) -> tuple[list[Path], int, int]:
+) -> tuple[list[Path], int, int, set[str]]:
     kept: list[Path] = []
     pre_skipped_not_in_fasta = 0
     pre_skipped_not_in_anchors = 0
+    anchors_with_candidate_file: set[str] = set()
     for path in files:
         accession = stem_to_accession(path)
         tsv_id = accession_to_tsv_id.get(accession)
@@ -220,7 +222,8 @@ def prefilter_tsv_files(
             pre_skipped_not_in_anchors += 1
             continue
         kept.append(path)
-    return kept, pre_skipped_not_in_fasta, pre_skipped_not_in_anchors
+        anchors_with_candidate_file.add(tsv_id)
+    return kept, pre_skipped_not_in_fasta, pre_skipped_not_in_anchors, anchors_with_candidate_file
 
 
 def dedupe_tsv_files(files: list[Path]) -> tuple[list[Path], int, list[str]]:
@@ -414,6 +417,23 @@ def main():
         help="Optional triplet TSV; when provided with --key-mode tsv_id, only anchor_id entries used by training are extracted",
     )
     parser.add_argument(
+        "--coverage-report",
+        type=Path,
+        default=None,
+        help="Optional path to write a JSON coverage report comparing requested triplet anchors against extracted coordinates.",
+    )
+    parser.add_argument(
+        "--missing-anchor-ids-output",
+        type=Path,
+        default=None,
+        help="Optional path to write the full list of triplet anchor IDs missing from extracted coordinates.",
+    )
+    parser.add_argument(
+        "--require-all-triplet-anchors",
+        action="store_true",
+        help="If set with --triplets-tsv and --key-mode tsv_id, fail at the end if any requested triplet anchor IDs are missing from the extracted coordinate output.",
+    )
+    parser.add_argument(
         "--index-map",
         type=Path,
         default=None,
@@ -479,6 +499,9 @@ def main():
     pre_skipped_not_in_anchors = 0
     dedup_dropped = 0
     dedup_examples: list[str] = []
+    allowed_anchor_ids: set[str] | None = None
+    anchors_with_candidate_file: set[str] = set()
+    anchors_extracted_successfully: set[str] = set()
     if args.key_mode == "tsv_id":
         if args.fasta is None:
             sys.exit("--fasta is required when --key-mode tsv_id")
@@ -495,13 +518,12 @@ def main():
             print(
                 f"[warn] duplicate accessions in FASTA; keeping first mapping for {len(duplicate_accessions)} accession(s)"
             )
-        allowed_anchor_ids = None
         if args.triplets_tsv is not None:
             allowed_anchor_ids = read_triplet_anchor_ids(args.triplets_tsv)
             print(
                 f"[info] loaded {len(allowed_anchor_ids)} unique anchor_id entries from {args.triplets_tsv}"
             )
-        files, pre_skipped, pre_skipped_not_in_anchors = prefilter_tsv_files(
+        files, pre_skipped, pre_skipped_not_in_anchors, anchors_with_candidate_file = prefilter_tsv_files(
             files, accession_to_tsv_id, allowed_tsv_ids=allowed_anchor_ids
         )
         print(
@@ -565,6 +587,8 @@ def main():
             shard_path = shard_dir / shard_name
             if not shard_path.exists():
                 raise FileNotFoundError(f"Checkpoint references missing shard file: {shard_path}")
+        if allowed_anchor_ids is not None:
+            anchors_extracted_successfully = {key for key in seen_keys if key in allowed_anchor_ids}
         print(
             f"[resume] loaded checkpoint {checkpoint_path} | processed={len(processed_files)}/{total_candidate_files} "
             f"saved_new={saved_new} overwritten={overwritten} skipped={skipped} failed={len(failed)} "
@@ -647,6 +671,8 @@ def main():
                         seen_keys.add(protein_key)
                     buffer_result[protein_key] = coords_arr
                     processed_files.add(file_token)
+                    if allowed_anchor_ids is not None and args.key_mode == "tsv_id" and protein_key in allowed_anchor_ids:
+                        anchors_extracted_successfully.add(protein_key)
                     if saved_new + overwritten <= 10:
                         print(f"  [{protein_key}] {path.name}: {coords_arr.shape[0]} residues")
 
@@ -717,6 +743,48 @@ def main():
         print("Overwrite examples: " + "; ".join(overwrite_examples[:10]))
     if failed:
         print(f"Failed ({len(failed)}): {', '.join(failed[:10])}" + (" ..." if len(failed) > 10 else ""))
+
+    if allowed_anchor_ids is not None and args.key_mode == "tsv_id":
+        requested_anchor_ids = set(allowed_anchor_ids)
+        missing_anchor_ids = sorted(requested_anchor_ids - anchors_extracted_successfully)
+        anchors_missing_no_file = sorted(requested_anchor_ids - anchors_with_candidate_file)
+        anchors_failed_after_match = sorted(anchors_with_candidate_file - anchors_extracted_successfully)
+        print(f"[coverage] requested anchors: {len(requested_anchor_ids)}")
+        print(f"[coverage] anchors with candidate structure file: {len(anchors_with_candidate_file)}")
+        print(f"[coverage] anchors extracted successfully: {len(anchors_extracted_successfully)}")
+        print(f"[coverage] missing with no matching structure file: {len(anchors_missing_no_file)}")
+        print(f"[coverage] matched file but extraction failed / no CA: {len(anchors_failed_after_match)}")
+        if anchors_missing_no_file:
+            print("[coverage] first missing-no-file anchors: " + ", ".join(anchors_missing_no_file[:10]))
+        if anchors_failed_after_match:
+            print("[coverage] first failed-after-match anchors: " + ", ".join(anchors_failed_after_match[:10]))
+        coverage_report = {
+            "requested_anchor_count": len(requested_anchor_ids),
+            "anchors_with_candidate_file_count": len(anchors_with_candidate_file),
+            "anchors_extracted_successfully_count": len(anchors_extracted_successfully),
+            "missing_anchor_count": len(missing_anchor_ids),
+            "anchors_missing_no_file_count": len(anchors_missing_no_file),
+            "anchors_failed_after_match_count": len(anchors_failed_after_match),
+            "first_missing_anchor_ids": missing_anchor_ids[:20],
+            "first_missing_no_file_anchor_ids": anchors_missing_no_file[:20],
+            "first_failed_after_match_anchor_ids": anchors_failed_after_match[:20],
+        }
+        coverage_path = args.coverage_report or Path(str(args.output) + ".coverage.json")
+        coverage_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(coverage_path, "w", encoding="utf-8") as fh:
+            json.dump(coverage_report, fh, indent=2, ensure_ascii=False)
+        print(f"[coverage] wrote coverage report to {coverage_path}")
+        if args.missing_anchor_ids_output is not None:
+            args.missing_anchor_ids_output.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.missing_anchor_ids_output, "w", encoding="utf-8") as fh:
+                for anchor_id in missing_anchor_ids:
+                    fh.write(f"{anchor_id}\n")
+            print(f"[coverage] wrote missing anchor IDs to {args.missing_anchor_ids_output}")
+        if args.require_all_triplet_anchors and missing_anchor_ids:
+            raise ValueError(
+                "Not all requested triplet anchors were covered by extracted coordinates. "
+                f"Requested: {len(requested_anchor_ids)}; extracted: {len(anchors_extracted_successfully)}; missing: {len(missing_anchor_ids)}"
+            )
 
     if checkpoint_path.exists():
         checkpoint_path.unlink()

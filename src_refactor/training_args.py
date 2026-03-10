@@ -437,6 +437,26 @@ class DataArguments:
         metadata={"help": "Optional path to the mol2vec model used for amino-acid molecular encodings."}
     )
 
+    filter_triplets_to_coordinate_coverage: bool = field(
+        default=False,
+        metadata={"help": "If true, drop triplet rows whose anchor_id is missing from the coordinate PKL instead of failing."}
+    )
+
+    filtered_triplets_output_tsv: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to save the filtered triplet TSV actually used for training."}
+    )
+
+    min_triplet_retention_ratio: float = field(
+        default=0.0,
+        metadata={"help": "Abort if filtering triplets by coordinate coverage retains less than this fraction of rows."}
+    )
+
+    triplet_filter_report_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to write a JSON report about triplet filtering by coordinate coverage."}
+    )
+
     # negative sampling
     negative_sampling_fn: str = field(
         default="simple_random",

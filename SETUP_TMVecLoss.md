@@ -127,6 +127,7 @@ python run_pretrain_refactor.py \
   --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
   --save_total_limit 3 \
+  --filter_triplets_to_coordinate_coverage True \
   --auto_resume_from_latest True
 ```
 
@@ -198,5 +199,6 @@ python run_pretrain_refactor.py \
   --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
   --save_total_limit 10 \
+  --filter_triplets_to_coordinate_coverage True \
   --auto_resume_from_latest True
 ```

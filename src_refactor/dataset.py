@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 from scipy.spatial import distance_matrix
 import pickle
+import csv
 # from .prediction import prediction
 import numpy as np
 import math as m
@@ -836,6 +837,10 @@ class ProteinSeqTripletDataset(Dataset):
         protein_seq_sample_limit: Optional[int] = None,
         coordinates_path: Optional[str] = None,
         aa_vec_model_path: Optional[str] = None,
+        filter_triplets_to_coordinate_coverage: bool = False,
+        filtered_triplets_output_tsv: Optional[str] = None,
+        min_triplet_retention_ratio: float = 0.0,
+        triplet_filter_report_path: Optional[str] = None,
     ):
         def trans_sequence(sequence: str) -> str:
             sequence = " ".join(sequence.strip())
@@ -847,6 +852,11 @@ class ProteinSeqTripletDataset(Dataset):
         self.max_protein_seq_length = max_protein_seq_length
         self.coordinates_path = coordinates_path
         self.aa_vec_model_path = aa_vec_model_path
+        self.filter_triplets_to_coordinate_coverage = bool(filter_triplets_to_coordinate_coverage)
+        self.filtered_triplets_output_tsv = filtered_triplets_output_tsv
+        self.min_triplet_retention_ratio = float(min_triplet_retention_ratio)
+        self.triplet_filter_report_path = triplet_filter_report_path
+        self._triplet_filter_report = None
         self.protein_cor = None
         self.aa_vocab = None
         if coordinates_path is not None:
@@ -866,6 +876,12 @@ class ProteinSeqTripletDataset(Dataset):
             self.triplets_tsv = os.path.join(self.data_dir, self.triplets_tsv)
         if not os.path.exists(self.triplets_tsv):
             raise FileNotFoundError(f"Triplet TSV not found: {self.triplets_tsv}")
+        if self.filtered_triplets_output_tsv is not None and not os.path.isabs(self.filtered_triplets_output_tsv):
+            self.filtered_triplets_output_tsv = os.path.join(self.data_dir, self.filtered_triplets_output_tsv)
+        if self.triplet_filter_report_path is not None and not os.path.isabs(self.triplet_filter_report_path):
+            self.triplet_filter_report_path = os.path.join(self.data_dir, self.triplet_filter_report_path)
+        if not 0.0 <= self.min_triplet_retention_ratio <= 1.0:
+            raise ValueError("min_triplet_retention_ratio must be in [0,1]")
         self.triplets = []
         with open(self.triplets_tsv, "r", encoding="utf-8") as f:
             first_line = f.readline()
@@ -928,22 +944,85 @@ class ProteinSeqTripletDataset(Dataset):
     def _validate_triplets_against_local_structure(self) -> None:
         if self.protein_cor is None:
             return
+
+        original_row_count = len(self.triplets)
         missing_anchor_rows = [i for i, row in enumerate(self.triplets) if not row.get('anchor_id')]
-        if missing_anchor_rows:
-            preview = ', '.join(str(i) for i in missing_anchor_rows[:10])
-            raise ValueError(
-                f"coordinates_path requires anchor_id in every triplet row; missing in {len(missing_anchor_rows)} rows. First rows: {preview}"
-            )
-        unique_anchor_ids = sorted({row['anchor_id'] for row in self.triplets})
+        unique_anchor_ids = sorted({row['anchor_id'] for row in self.triplets if row.get('anchor_id')})
         coord_keys = set(self.protein_cor.keys())
         missing_anchor_ids = [anchor_id for anchor_id in unique_anchor_ids if anchor_id not in coord_keys]
-        if missing_anchor_ids:
-            preview = ', '.join(str(x) for x in missing_anchor_ids[:20])
-            raise ValueError(
-                "Coordinate PKL is missing anchor IDs required by the triplet TSV. "
-                f"Unique TSV anchors: {len(unique_anchor_ids)}; found in PKL: {len(unique_anchor_ids) - len(missing_anchor_ids)}; "
-                f"missing: {len(missing_anchor_ids)}. First missing IDs: {preview}"
+
+        if missing_anchor_rows or missing_anchor_ids:
+            if not self.filter_triplets_to_coordinate_coverage:
+                if missing_anchor_rows:
+                    preview = ', '.join(str(i) for i in missing_anchor_rows[:10])
+                    raise ValueError(
+                        f"coordinates_path requires anchor_id in every triplet row; missing in {len(missing_anchor_rows)} rows. First rows: {preview}"
+                    )
+                preview = ', '.join(str(x) for x in missing_anchor_ids[:20])
+                raise ValueError(
+                    "Coordinate PKL is missing anchor IDs required by the triplet TSV. "
+                    f"Unique TSV anchors: {len(unique_anchor_ids)}; found in PKL: {len(unique_anchor_ids) - len(missing_anchor_ids)}; "
+                    f"missing: {len(missing_anchor_ids)}. First missing IDs: {preview}"
+                )
+
+            filtered_triplets = []
+            dropped_missing_anchor_id_rows = []
+            dropped_anchor_id_set = set()
+            for row_idx, row in enumerate(self.triplets):
+                anchor_id = row.get('anchor_id')
+                if not anchor_id:
+                    dropped_missing_anchor_id_rows.append(row_idx)
+                    continue
+                if anchor_id not in coord_keys:
+                    dropped_anchor_id_set.add(anchor_id)
+                    continue
+                filtered_triplets.append(row)
+
+            retained_rows = len(filtered_triplets)
+            retention_ratio = (retained_rows / original_row_count) if original_row_count > 0 else 0.0
+            if retained_rows == 0:
+                raise ValueError("Filtering triplets by coordinate coverage would remove all rows; cannot continue.")
+            if retention_ratio < self.min_triplet_retention_ratio:
+                raise ValueError(
+                    "Filtering triplets by coordinate coverage retained too little data. "
+                    f"Retention ratio: {retention_ratio:.4f}; minimum required: {self.min_triplet_retention_ratio:.4f}"
+                )
+
+            self.triplets = filtered_triplets
+            retained_anchor_ids = sorted({row['anchor_id'] for row in self.triplets if row.get('anchor_id')})
+            self._triplet_filter_report = {
+                'original_row_count': original_row_count,
+                'retained_row_count': retained_rows,
+                'dropped_row_count': original_row_count - retained_rows,
+                'retention_ratio': retention_ratio,
+                'original_unique_anchor_count': len(unique_anchor_ids),
+                'retained_unique_anchor_count': len(retained_anchor_ids),
+                'dropped_unique_anchor_count': len(dropped_anchor_id_set),
+                'dropped_missing_anchor_id_row_count': len(dropped_missing_anchor_id_rows),
+                'first_dropped_missing_anchor_id_rows': dropped_missing_anchor_id_rows[:20],
+                'first_dropped_anchor_ids': sorted(dropped_anchor_id_set)[:20],
+            }
+            logger.warning(
+                "Triplet coordinate coverage filtering enabled: retained %d/%d rows (%.2f%%), retained %d/%d unique anchors; dropped %d unique anchors missing from coordinate PKL.",
+                retained_rows,
+                original_row_count,
+                100.0 * retention_ratio,
+                len(retained_anchor_ids),
+                len(unique_anchor_ids),
+                len(dropped_anchor_id_set),
             )
+            if dropped_missing_anchor_id_rows:
+                logger.warning(
+                    "Dropped %d triplet rows with missing anchor_id. First rows: %s",
+                    len(dropped_missing_anchor_id_rows),
+                    ', '.join(str(i) for i in dropped_missing_anchor_id_rows[:10]),
+                )
+            if self.filtered_triplets_output_tsv is not None:
+                self._write_filtered_triplets_tsv(self.filtered_triplets_output_tsv)
+                logger.info("Wrote filtered triplet TSV to %s", self.filtered_triplets_output_tsv)
+            if self.triplet_filter_report_path is not None:
+                self._write_triplet_filter_report(self.triplet_filter_report_path)
+                logger.info("Wrote triplet filter report to %s", self.triplet_filter_report_path)
 
         sampled_warnings = []
         sample_count = min(20, len(self.triplets))
@@ -960,8 +1039,22 @@ class ProteinSeqTripletDataset(Dataset):
         logger.info(
             "Validated triplet/local-structure inputs: %d rows, %d unique anchors, coordinate coverage OK.",
             len(self.triplets),
-            len(unique_anchor_ids),
+            len({row['anchor_id'] for row in self.triplets if row.get('anchor_id')}),
         )
+
+    def _write_filtered_triplets_tsv(self, output_path: str) -> None:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        fieldnames = ['anchor_id', 'positive_id', 'negative_id', 'anchor_seq', 'positive_seq', 'negative_seq', 'positive_score', 'negative_score']
+        with open(output_path, 'w', encoding='utf-8', newline='') as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter='	')
+            writer.writeheader()
+            for row in self.triplets:
+                writer.writerow({k: ('' if row.get(k) is None else row.get(k)) for k in fieldnames})
+
+    def _write_triplet_filter_report(self, output_path: str) -> None:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as fh:
+            json.dump(self._triplet_filter_report or {}, fh, indent=2, ensure_ascii=False)
 
     def __len__(self) -> int:
         return len(self.triplets)

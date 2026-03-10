@@ -101,6 +101,10 @@ def main():
                     protein_seq_sample_limit=data_args.protein_seq_sample_limit,
                     coordinates_path=data_args.coordinates_path,
                     aa_vec_model_path=data_args.aa_vec_model_path,
+                    filter_triplets_to_coordinate_coverage=data_args.filter_triplets_to_coordinate_coverage,
+                    filtered_triplets_output_tsv=data_args.filtered_triplets_output_tsv,
+                    min_triplet_retention_ratio=data_args.min_triplet_retention_ratio,
+                    triplet_filter_report_path=data_args.triplet_filter_report_path,
                 )
             else:
                 if data_args.tmvec_pairs_tsv is None:
