@@ -118,10 +118,11 @@ python scripts_refactor/extract_ca_coords.py \
 python run_pretrain_refactor.py \
   --model_protein_seq_data True \
   --use_tmvec_loss True \
+  --pretrain_data_dir data/pretrain_data \
   --output_dir outputs/glprotein_small \
-  --tmvec_triplets_tsv data/pretrain_data/tmvec_triplets_small.tsv \
-  --coordinates_dir data/pretrain_data/coordinates_small \
-  --aa_vec_vocab_path data/pretrain_data/aa_vocab.pkl \
+  --tmvec_triplets_tsv tmvec_triplets_small.tsv \
+  --coordinates_dir coordinates_small \
+  --aa_vec_vocab_path aa_vocab.pkl \
   --filter_triplets_to_coordinate_coverage True \
   --coordinate_cache_size 32 \
   --weight_decay 0.01 \
@@ -195,10 +196,11 @@ Checkpoints are saved during training. If interrupted, make sure `--resume` is i
 python run_pretrain_refactor.py \
   --model_protein_seq_data True \
   --use_tmvec_loss True \
+  --pretrain_data_dir data/pretrain_data \
   --output_dir outputs/glprotein_full \
-  --tmvec_triplets_tsv data/pretrain_data/tmvec_triplets_full.tsv \
-  --coordinates_dir data/pretrain_data/coordinates_full \
-  --aa_vec_vocab_path data/pretrain_data/aa_vocab.pkl \
+  --tmvec_triplets_tsv tmvec_triplets_full.tsv \
+  --coordinates_dir coordinates_full \
+  --aa_vec_vocab_path aa_vocab.pkl \
   --filter_triplets_to_coordinate_coverage True \
   --coordinate_cache_size 32 \
   --weight_decay 0.01 \

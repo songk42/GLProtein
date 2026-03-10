@@ -711,9 +711,13 @@ class KnowledgeDecoder(BertPreTrainedModel):
     def __init__(self,decoder_config=None):
         super().__init__(decoder_config)
 
-        # textbert for relation and GO feature extraction, all param.requires_grad = False
+        # textbert for relation and GO feature extraction. Avoid nested
+        # BertModel.from_pretrained() calls inside __init__, because
+        # KnowledgeDecoder.from_pretrained() may construct the module under a
+        # meta-device initialization context.
         textbert_config = AutoConfig.from_pretrained(decoder_config.text_model_path)
-        self.textbert = BertModel.from_pretrained(decoder_config.text_model_path, output_hidden_states=True)
+        textbert_config.output_hidden_states = True
+        self.textbert = BertModel(textbert_config)
         for param in self.textbert.parameters():
             param.requires_grad = False
 
@@ -743,6 +747,18 @@ class KnowledgeDecoder(BertPreTrainedModel):
         # pfi head, requires pooled outputs
         if decoder_config.use_pfi:
             self.pfi_cls = nn.Sequential(nn.Linear(self.config.hidden_size, 2), nn.Softmax(dim=-1))
+
+    def load_textbert_backbone(self, text_model_path: Optional[os.PathLike] = None):
+        text_model_path = text_model_path or getattr(self.config, 'text_model_path', None)
+        if not text_model_path:
+            raise ValueError('KnowledgeDecoder.load_textbert_backbone() requires text_model_path.')
+        textbert = BertModel.from_pretrained(text_model_path, output_hidden_states=True)
+        for param in textbert.parameters():
+            param.requires_grad = False
+        self.textbert = textbert
+        self.text_feat_dim = self.textbert.config.hidden_size
+        self.text_pooler = BertPooler(self.textbert.config)
+        return self
       
     def forward(self, 
         # relation_inputs,
@@ -1120,6 +1136,9 @@ class GLProtein(nn.Module):
             kmae_model = cls(config=kmae_config)
             kmae_model.encoder = BertModel.from_pretrained(encoder_dir)
             kmae_model.decoder = KnowledgeDecoder.from_pretrained(decoder_dir)
+            if text_model_path is not None:
+                kmae_model.decoder.config.text_model_path = text_model_path
+                kmae_model.decoder.load_textbert_backbone(text_model_path)
             kmae_model.eval()
             return kmae_model
 
@@ -1154,8 +1173,11 @@ class GLProtein(nn.Module):
             if os.path.exists(os.path.join(decoder_model_path, 'pytorch_model.bin')):
                 logger.info(f'Loading Decoder Model from {decoder_model_path}')
                 kmae_model.decoder = KnowledgeDecoder.from_pretrained(decoder_model_path)
+                kmae_model.decoder.config.text_model_path = text_model_path
+                kmae_model.decoder.load_textbert_backbone(text_model_path)
             else:
                 kmae_model.decoder = KnowledgeDecoder(kmae_config.decoder_config)
+                kmae_model.decoder.load_textbert_backbone(text_model_path)
         else:
             raise NotImplementedError('Currently only support bert cls')
 
