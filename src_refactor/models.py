@@ -3,6 +3,7 @@ import os
 import json
 import copy
 from typing import Optional, Tuple, Union
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -58,6 +59,43 @@ DECODER_CONFIG_NAME = "config.json"
 PROTEIN_CONFIG_NAME = "config.json"
 PROTEIN_MODEL_STATE_DICT_NAME = 'pytorch_model.bin'
 DECODER_MODEL_STATE_DICT_NAME = 'pytorch_model.bin'
+GLPROTEIN_CONFIG_NAME = 'glprotein_config.json'
+GLPROTEIN_CHECKPOINT_VERSION = 1
+
+
+def _json_default(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_default(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_default(v) for k, v in value.items()}
+    return str(value)
+
+
+def resolve_glprotein_checkpoint_paths(checkpoint_dir: os.PathLike) -> Dict[str, Any]:
+    checkpoint_dir = os.fspath(checkpoint_dir)
+    config_path = os.path.join(checkpoint_dir, GLPROTEIN_CONFIG_NAME)
+    metadata: Dict[str, Any] = {}
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as handle:
+            metadata = json.load(handle)
+
+    encoder_subdir = metadata.get('encoder_subdir', 'encoder')
+    decoder_subdir = metadata.get('decoder_subdir', 'decoder')
+    protein_tokenizer_subdir = metadata.get('protein_tokenizer_subdir', 'protein_tokenizer')
+    text_tokenizer_subdir = metadata.get('text_tokenizer_subdir', 'text_tokenizer')
+
+    paths = {
+        'checkpoint_dir': checkpoint_dir,
+        'config_path': config_path if os.path.exists(config_path) else None,
+        'metadata': metadata,
+        'encoder_dir': os.path.join(checkpoint_dir, encoder_subdir),
+        'decoder_dir': os.path.join(checkpoint_dir, decoder_subdir),
+        'protein_tokenizer_dir': os.path.join(checkpoint_dir, protein_tokenizer_subdir),
+        'text_tokenizer_dir': os.path.join(checkpoint_dir, text_tokenizer_subdir),
+    }
+    return paths
 
 
 __HEAD_MASK_WARNING_MSG = """
@@ -569,6 +607,21 @@ class GLProteinConfig:
         self.protein_model_config = None
         self.decoder_config = None
 
+    def to_serializable_dict(self) -> Dict[str, Any]:
+        return {
+            'use_desc': self.use_desc,
+            'num_relations': self.num_relations,
+            'num_go_terms': self.num_go_terms,
+            'num_proteins': self.num_proteins,
+            'protein_encoder_cls': self.protein_encoder_cls,
+            'go_encoder_cls': self.go_encoder_cls,
+        }
+
+    @classmethod
+    def from_serializable_dict(cls, payload: Optional[Dict[str, Any]] = None):
+        payload = dict(payload or {})
+        return cls(**payload)
+
     def save_to_json_file(self, encoder_save_directory: os.PathLike):
         os.makedirs(encoder_save_directory, exist_ok=True)
         # os.makedirs(decoder_save_directory, exist_ok=True)
@@ -952,25 +1005,75 @@ class GLProtein(nn.Module):
         return pooled / denom
 
 
-    def save_pretrained(self,save_directory: os.PathLike,state_dict: Optional[dict] = None,save_config: bool = True,
-    ):
+    def save_pretrained(self, save_directory: os.PathLike, state_dict: Optional[dict] = None, save_config: bool = True):
+        save_directory = os.fspath(save_directory)
+        os.makedirs(save_directory, exist_ok=True)
         encoder_save_directory = os.path.join(save_directory, 'encoder')
-        # decoder_save_directory = os.path.join(save_directory, 'decoder')
+        decoder_save_directory = os.path.join(save_directory, 'decoder')
 
-        self.encoder.save_pretrained(encoder_save_directory, save_config=save_config)
-        # self.decoder.save_pretrained(decoder_save_directory, save_config=save_config)
+        encoder_state_dict = None
+        decoder_state_dict = None
+        if state_dict is not None:
+            encoder_state_dict = {
+                name[len('encoder.'):]: tensor
+                for name, tensor in state_dict.items()
+                if name.startswith('encoder.')
+            }
+            decoder_state_dict = {
+                name[len('decoder.'):]: tensor
+                for name, tensor in state_dict.items()
+                if name.startswith('decoder.')
+            }
+
+        self.encoder.save_pretrained(encoder_save_directory, save_config=save_config, state_dict=encoder_state_dict)
+        if self.decoder is None:
+            raise ValueError('GLProtein.save_pretrained() expected self.decoder to be initialized.')
+        self.decoder.save_pretrained(decoder_save_directory, save_config=save_config, state_dict=decoder_state_dict)
+
+        wrapper_payload = {
+            'format_version': GLPROTEIN_CHECKPOINT_VERSION,
+            'model_class': self.__class__.__name__,
+            'encoder_subdir': 'encoder',
+            'decoder_subdir': 'decoder',
+            'protein_tokenizer_subdir': 'protein_tokenizer',
+            'text_tokenizer_subdir': 'text_tokenizer',
+            'wrapper_config': GLProteinConfig(
+                use_desc=getattr(self.decoder_config, 'use_desc', None),
+                num_relations=getattr(self.decoder_config, 'num_relations', None),
+                num_go_terms=getattr(self.decoder_config, 'num_go_terms', None),
+                num_proteins=getattr(self.decoder_config, 'num_proteins', None),
+                protein_encoder_cls=getattr(self.decoder_config, 'protein_encoder_cls', None),
+                go_encoder_cls=getattr(self.decoder_config, 'go_encoder_cls', None),
+            ).to_serializable_dict(),
+            'decoder_text_model_path': getattr(self.decoder_config, 'text_model_path', None),
+            'notes': 'Full pretrained GLProtein checkpoint',
+        }
+        with open(os.path.join(save_directory, GLPROTEIN_CONFIG_NAME), 'w', encoding='utf-8') as handle:
+            json.dump(wrapper_payload, handle, indent=2, ensure_ascii=False, default=_json_default)
 
         logger.info(f'Encoder Model weights saved in {encoder_save_directory}')
-        # logger.info(f'Decoder Model weights saved in {decoder_save_directory}')
+        logger.info(f'Decoder Model weights saved in {decoder_save_directory}')
+
+    @classmethod
+    def get_encoder_checkpoint_path(cls, checkpoint_dir: os.PathLike) -> str:
+        return resolve_glprotein_checkpoint_paths(checkpoint_dir)['encoder_dir']
+
+    @classmethod
+    def load_encoder_from_checkpoint(cls, checkpoint_dir: os.PathLike) -> BertModel:
+        encoder_dir = cls.get_encoder_checkpoint_path(checkpoint_dir)
+        if not os.path.isdir(encoder_dir):
+            raise FileNotFoundError(f'Encoder checkpoint directory not found: {encoder_dir}')
+        return BertModel.from_pretrained(encoder_dir)
 
     @classmethod
     def from_pretrained(
-        cls, 
-        protein_model_path: os.PathLike, 
-        text_model_path: os.PathLike,
-        decoder_model_path: os.PathLike,
-        model_args = None,
-        training_args = None,
+        cls,
+        protein_model_path: Optional[os.PathLike] = None,
+        text_model_path: Optional[os.PathLike] = None,
+        decoder_model_path: Optional[os.PathLike] = None,
+        model_args=None,
+        training_args=None,
+        checkpoint_dir: Optional[os.PathLike] = None,
         **kwargs
     ):
 
@@ -979,20 +1082,64 @@ class GLProtein(nn.Module):
         num_go_terms = kwargs.pop('num_go_terms', None)
         num_proteins = kwargs.pop('num_proteins', None)
 
+        candidate_checkpoint = checkpoint_dir or kwargs.pop('model_checkpoint_path', None)
+        if candidate_checkpoint is None and protein_model_path is not None:
+            candidate_path = Path(os.fspath(protein_model_path))
+            if candidate_path.is_dir() and (candidate_path / GLPROTEIN_CONFIG_NAME).exists():
+                candidate_checkpoint = candidate_path
+
+        if candidate_checkpoint is not None:
+            resolved = resolve_glprotein_checkpoint_paths(candidate_checkpoint)
+            encoder_dir = resolved['encoder_dir']
+            decoder_dir = resolved['decoder_dir']
+            metadata = resolved['metadata'] or {}
+            if not os.path.isdir(encoder_dir):
+                raise FileNotFoundError(f'GLProtein checkpoint is missing encoder directory: {encoder_dir}')
+            if not os.path.isdir(decoder_dir):
+                raise FileNotFoundError(
+                    f'Checkpoint is encoder-only and cannot restore full GLProtein decoder state: {decoder_dir}'
+                )
+
+            kmae_config = GLProteinConfig.from_json_file(encoder_dir, decoder_dir)
+            wrapper_cfg = GLProteinConfig.from_serializable_dict(metadata.get('wrapper_config'))
+            kmae_config.use_desc = wrapper_cfg.use_desc
+            kmae_config.num_relations = wrapper_cfg.num_relations
+            kmae_config.num_go_terms = wrapper_cfg.num_go_terms
+            kmae_config.num_proteins = wrapper_cfg.num_proteins
+            kmae_config.protein_encoder_cls = wrapper_cfg.protein_encoder_cls
+            kmae_config.go_encoder_cls = wrapper_cfg.go_encoder_cls
+
+            if text_model_path is None:
+                text_model_path = metadata.get('decoder_text_model_path') or getattr(kmae_config.decoder_config, 'text_model_path', None)
+            if text_model_path is not None:
+                kmae_config.decoder_config.text_model_path = text_model_path
+            if training_args is not None:
+                kmae_config.decoder_config.use_desc = training_args.use_desc
+                kmae_config.decoder_config.use_pfi = training_args.use_pfi
+
+            kmae_model = cls(config=kmae_config)
+            kmae_model.encoder = BertModel.from_pretrained(encoder_dir)
+            kmae_model.decoder = KnowledgeDecoder.from_pretrained(decoder_dir)
+            kmae_model.eval()
+            return kmae_model
+
+        if protein_model_path is None or decoder_model_path is None or text_model_path is None:
+            raise ValueError('Legacy GLProtein.from_pretrained requires protein_model_path, text_model_path, and decoder_model_path.')
+
         # 1 assign useful configs to decoder config
         kmae_config = GLProteinConfig.from_json_file(protein_model_path, decoder_model_path)
-        kmae_config.decoder_config.num_relations=num_relations,
-        kmae_config.decoder_config.num_go_terms=num_go_terms,
-        kmae_config.decoder_config.num_proteins=num_proteins,
+        kmae_config.decoder_config.num_relations = num_relations
+        kmae_config.decoder_config.num_go_terms = num_go_terms
+        kmae_config.decoder_config.num_proteins = num_proteins
         if training_args:
-            kmae_config.decoder_config.use_desc=training_args.use_desc,
+            kmae_config.decoder_config.use_desc = training_args.use_desc
             kmae_config.decoder_config.use_pfi = training_args.use_pfi
         if model_args:
-            kmae_config.decoder_config.go_encoder_cls=model_args.go_encoder_cls,
-            kmae_config.decoder_config.protein_encoder_cls=model_args.protein_encoder_cls
+            kmae_config.decoder_config.go_encoder_cls = model_args.go_encoder_cls
+            kmae_config.decoder_config.protein_encoder_cls = model_args.protein_encoder_cls
 
         kmae_config.decoder_config.text_model_path = text_model_path
-        
+
         # instantiate model. Note textbert in decoder is initialized in this step
         kmae_model = cls(config=kmae_config)
 
@@ -1000,22 +1147,19 @@ class GLProtein(nn.Module):
         if kmae_model.decoder_config.protein_encoder_cls == 'bert':
             kmae_model.encoder = BertModel.from_pretrained(protein_model_path)
         else:
-            raise NotImplementedError("Currently only support bert for encoder")
+            raise NotImplementedError('Currently only support bert for encoder')
 
         # 3 load decoder model
         if kmae_model.decoder_config.model_type == 'bert':
-            # if decoder state dict exists load decoder
-            if os.path.exists(os.path.join(decoder_model_path,'pytorch_model.bin')):
+            if os.path.exists(os.path.join(decoder_model_path, 'pytorch_model.bin')):
                 logger.info(f'Loading Decoder Model from {decoder_model_path}')
                 kmae_model.decoder = KnowledgeDecoder.from_pretrained(decoder_model_path)
-            # if decoder state dict does not exists (first time training)
             else:
                 kmae_model.decoder = KnowledgeDecoder(kmae_config.decoder_config)
         else:
-            raise NotImplementedError("Currently only support bert cls")
-        
-        kmae_model.eval()
+            raise NotImplementedError('Currently only support bert cls')
 
+        kmae_model.eval()
         return kmae_model
 
 @dataclass

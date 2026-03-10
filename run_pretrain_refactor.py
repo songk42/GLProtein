@@ -100,7 +100,10 @@ def main():
                     max_protein_seq_length=data_args.max_protein_seq_length,
                     protein_seq_sample_limit=data_args.protein_seq_sample_limit,
                     coordinates_path=data_args.coordinates_path,
+                    coordinates_dir=data_args.coordinates_dir,
                     aa_vec_model_path=data_args.aa_vec_model_path,
+                    aa_vec_vocab_path=data_args.aa_vec_vocab_path,
+                    coordinate_cache_size=data_args.coordinate_cache_size,
                     filter_triplets_to_coordinate_coverage=data_args.filter_triplets_to_coordinate_coverage,
                     filtered_triplets_output_tsv=data_args.filtered_triplets_output_tsv,
                     min_triplet_retention_ratio=data_args.min_triplet_retention_ratio,
@@ -141,16 +144,41 @@ def main():
     # protein_go_data_collator = DataCollatorForProteinGo(protein_tokenizer=protein_tokenizer, text_tokenizer=text_tokenizer, are_protein_length_same=are_protein_length_same, use_pfi=use_pfi)
     # go_go_data_collator = DataCollatorForGoGo(tokenizer=text_tokenizer)
 
-    model = GLProtein.from_pretrained(
-        protein_model_path=model_args.encoder_model_file_name,
-        text_model_path=model_args.text_model_file_name,
-        decoder_model_path = model_args.decoder_model_file_name,
-        model_args=model_args,
-        training_args=training_args,
-        # num_relations=num_relations,
-        # num_go_terms=num_go_terms,
-        # num_proteins=num_proteins,
-    )
+    resolved_resume_checkpoint = None
+    if training_args.resume_from_checkpoint:
+        resolved_resume_checkpoint = training_args.resume_from_checkpoint
+    elif training_args.auto_resume_from_latest:
+        resolved_resume_checkpoint = _find_latest_checkpoint(training_args.output_dir)
+
+    model_checkpoint_path = training_args.model_checkpoint_path
+
+    if resolved_resume_checkpoint and training_args.load_full_glprotein_checkpoint:
+        logger.info(f"Loading model weights from resume checkpoint: {resolved_resume_checkpoint}")
+        model = GLProtein.from_pretrained(
+            checkpoint_dir=resolved_resume_checkpoint,
+            text_model_path=model_args.text_model_file_name,
+            model_args=model_args,
+            training_args=training_args,
+        )
+    elif model_checkpoint_path and training_args.load_full_glprotein_checkpoint:
+        logger.info(f"Loading model weights from GLProtein checkpoint: {model_checkpoint_path}")
+        model = GLProtein.from_pretrained(
+            checkpoint_dir=model_checkpoint_path,
+            text_model_path=model_args.text_model_file_name,
+            model_args=model_args,
+            training_args=training_args,
+        )
+    else:
+        model = GLProtein.from_pretrained(
+            protein_model_path=model_args.encoder_model_file_name,
+            text_model_path=model_args.text_model_file_name,
+            decoder_model_path = model_args.decoder_model_file_name,
+            model_args=model_args,
+            training_args=training_args,
+            # num_relations=num_relations,
+            # num_go_terms=num_go_terms,
+            # num_proteins=num_proteins,
+        )
 
     if training_args.gradient_checkpointing:
         if hasattr(model.encoder, 'gradient_checkpointing_enable'):
@@ -187,17 +215,12 @@ def main():
         protein_seq_data_collator=protein_seq_data_collator,
         # protein_go_data_collator=protein_go_data_collator,
         # go_go_data_collator=go_go_data_collator
+        protein_tokenizer=protein_tokenizer,
+        text_tokenizer=text_tokenizer,
     )
 
     # Pretraining
     if training_args.do_train:
-        # add path to checkpoint here to resume training
-        resolved_resume_checkpoint = None
-        if training_args.resume_from_checkpoint:
-            resolved_resume_checkpoint = training_args.resume_from_checkpoint
-        elif training_args.auto_resume_from_latest:
-            resolved_resume_checkpoint = _find_latest_checkpoint(training_args.output_dir)
-
         if resolved_resume_checkpoint:
             logger.info(f"Resuming training from checkpoint: {resolved_resume_checkpoint}")
         else:

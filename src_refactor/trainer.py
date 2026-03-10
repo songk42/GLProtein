@@ -272,6 +272,8 @@ class GLProteinTrainer(Trainer):
         protein_seq_data_collator: DataCollatorForLanguageModeling = None,
         protein_go_data_collator: DataCollatorForProteinGo = None,
         go_go_data_collator: DataCollatorForGoGo = None,
+        protein_tokenizer = None,
+        text_tokenizer = None,
     ):
         super().__init__(
             model=model,
@@ -284,6 +286,8 @@ class GLProteinTrainer(Trainer):
         self.protein_seq_data_collator = protein_seq_data_collator
         self.protein_go_data_collator = protein_go_data_collator
         self.go_go_data_collator = go_go_data_collator
+        self.protein_tokenizer = protein_tokenizer
+        self.text_tokenizer = text_tokenizer
 
         self.model_loss = GLProteinLoss(pfi_weight = self.args.pfi_lambda, mlm_lambda=self.args.mlm_lambda,
             num_protein_go_neg_sample=self.args.num_protein_go_neg_sample)
@@ -304,7 +308,8 @@ class GLProteinTrainer(Trainer):
                 )
 
         self.use_amp = False
-        self.loss_recorder = []
+        self.loss_trace_maxlen = max(1, int(getattr(self.args, 'loss_trace_max_history', 1000)))
+        self.loss_recorder = collections.deque(maxlen=self.loss_trace_maxlen)
         self.loss_trace_file = os.path.join(self.args.output_dir, "loss_trace.jsonl") if getattr(self.args, "output_dir", None) else None
 
 
@@ -323,7 +328,7 @@ class GLProteinTrainer(Trainer):
             for key in row.keys():
                 if key not in fieldnames:
                     fieldnames.append(key)
-        csv_path = os.path.join(output_dir, 'loss_trace.csv')
+        csv_path = os.path.join(output_dir, 'loss_trace_recent.csv')
         with open(csv_path, 'w', encoding='utf-8', newline='') as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -352,17 +357,18 @@ class GLProteinTrainer(Trainer):
             torch.cuda.set_rng_state_all(rng_state['cuda'])
 
     def _load_loss_trace(self, checkpoint_dir: str) -> None:
-        loss_path = os.path.join(checkpoint_dir, 'loss_trace.json')
-        if not os.path.exists(loss_path):
-            self.loss_recorder = []
+        loss_candidates = [
+            os.path.join(checkpoint_dir, 'loss_trace_recent.json'),
+            os.path.join(checkpoint_dir, 'loss_trace.json'),
+        ]
+        self.loss_recorder = collections.deque(maxlen=self.loss_trace_maxlen)
+        loss_path = next((path for path in loss_candidates if os.path.exists(path)), None)
+        if loss_path is None:
             return
         with open(loss_path, 'r', encoding='utf-8') as handle:
-            self.loss_recorder = json.load(handle)
-        if self.loss_trace_file:
-            os.makedirs(self.args.output_dir, exist_ok=True)
-            with open(self.loss_trace_file, 'w', encoding='utf-8') as handle:
-                for row in self.loss_recorder:
-                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            loaded_rows = json.load(handle)
+        for row in loaded_rows:
+            self.loss_recorder.append(row)
 
     def _rotate_checkpoints(self) -> None:
         save_total_limit = getattr(self.args, 'save_total_limit', None)
@@ -375,7 +381,12 @@ class GLProteinTrainer(Trainer):
 
     def _load_non_deepspeed_checkpoint(self, checkpoint_dir: str) -> None:
         logger.info("Loading model state from checkpoint %s", checkpoint_dir)
-        self._load_from_checkpoint(checkpoint_dir)
+        glprotein_config_path = os.path.join(checkpoint_dir, 'glprotein_config.json')
+        if os.path.exists(glprotein_config_path):
+            loaded_model = GLProtein.from_pretrained(checkpoint_dir=checkpoint_dir)
+            self.model.load_state_dict(loaded_model.state_dict(), strict=True)
+        else:
+            self._load_from_checkpoint(checkpoint_dir)
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         if os.path.exists(trainer_state_path):
             self.state = TrainerState.load_from_json(trainer_state_path)
@@ -510,8 +521,9 @@ class GLProteinTrainer(Trainer):
         logger.info(f"  Total optimization steps = {max_steps}")
 
         start_time = time.time()
-        raw_steps_trained = int(self.state.global_step)
-        epochs_trained = 0
+        update_steps_trained = int(self.state.global_step)
+        raw_steps_trained = update_steps_trained * max(args.gradient_accumulation_steps, 1)
+        micro_steps_trained = raw_steps_trained
         steps_trained_in_current_epoch = 0
         steps_trained_progress_bar = None
 
@@ -539,7 +551,6 @@ class GLProteinTrainer(Trainer):
         # cur_protein_go_epoch = 0
 
         if raw_steps_trained > 0 and num_protein_seq_steps_per_epoch > 0:
-            epochs_trained = raw_steps_trained
             cur_protein_seq_epoch = raw_steps_trained // num_protein_seq_steps_per_epoch
             steps_trained_in_current_epoch = raw_steps_trained % num_protein_seq_steps_per_epoch
             self.state.epoch = raw_steps_trained / max(num_protein_seq_steps_per_epoch, 1)
@@ -552,7 +563,8 @@ class GLProteinTrainer(Trainer):
                 if protein_seq_iter is not None:
                     next(protein_seq_iter)
             logger.info(
-                "Resuming training from step %d (epoch index %d, step offset %d within epoch)",
+                "Resuming training from optimizer step %d (raw micro-step %d, epoch index %d, step offset %d within epoch)",
+                update_steps_trained,
                 raw_steps_trained,
                 cur_protein_seq_epoch,
                 steps_trained_in_current_epoch,
@@ -560,15 +572,13 @@ class GLProteinTrainer(Trainer):
         else:
             self.state.epoch = 0
 
-        train_iterator = range(
-            epochs_trained, max_steps
-        )
-
-        for step in train_iterator:
-            # tempt = time.time()
+        raw_step = raw_steps_trained
+        while self.state.global_step < max_steps:
+            step = raw_step
+            micro_step_in_accum = (step + 1) % args.gradient_accumulation_steps
 
             # update the seed of dataloader
-            if num_protein_seq_steps_per_epoch != -1 and (step + 1) % num_protein_seq_steps_per_epoch == 0:
+            if num_protein_seq_steps_per_epoch != -1 and step > raw_steps_trained and step % num_protein_seq_steps_per_epoch == 0:
                 cur_protein_seq_epoch += 1
                 if isinstance(protein_seq_dataloader.sampler, DistributedSampler):
                     protein_seq_dataloader.sampler.set_epoch(cur_protein_seq_epoch)
@@ -576,7 +586,7 @@ class GLProteinTrainer(Trainer):
                     protein_seq_dataloader.dataset.set_epoch(cur_protein_seq_epoch)
                 protein_seq_iter = iter(protein_seq_dataloader)
 
-            # if num_protein_go_steps_per_epoch != -1 and (step + 1) % num_protein_go_steps_per_epoch == 0:
+            # if num_protein_go_steps_per_epoch != -1 and step > raw_steps_trained and step % num_protein_go_steps_per_epoch == 0:
             #     cur_protein_go_epoch += 1
             #     if isinstance(protein_go_dataloader.sampler, DistributedSampler):
             #         protein_go_dataloader.sampler.set_epoch(cur_protein_go_epoch)
@@ -604,7 +614,7 @@ class GLProteinTrainer(Trainer):
             # pdb.set_trace() 
 
             if (
-                ((step + 1) % args.gradient_accumulation_steps != 0)
+                (micro_step_in_accum != 0)
                 and args.local_rank != -1
                 and args._no_sync_in_gradient_accumulation
             ):
@@ -616,21 +626,14 @@ class GLProteinTrainer(Trainer):
                 loss, all_loss = self.training_step(model, protein_seq_inputs, protein_go_inputs, go_go_inputs)
                 tr_loss += loss
 
-            # record loss.
-            if args.local_rank == -1 or args.local_rank == 0:
-                all_loss['global_step'] = int(self.state.global_step)
-                all_loss['learning_rate'] = self.get_learning_rate()
-                all_loss = dict(all_loss)
-                logger.info("loss and lr dict: %s",str(all_loss))
-                print(all_loss)
-                self.loss_recorder.append(all_loss)
-                self._append_loss_trace(all_loss)
+            micro_steps_trained += 1
+            self.state.epoch = micro_steps_trained / max(num_protein_seq_steps_per_epoch, 1) if num_protein_seq_steps_per_epoch > 0 else 0
 
             # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
             if self.deepspeed:
                 self.deepspeed.step()
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if micro_step_in_accum == 0:
                 # Gradient clipping
                 if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
                     # deepspeed does its own clipping
@@ -666,11 +669,20 @@ class GLProteinTrainer(Trainer):
                     self.lr_scheduler.step()
                 model.zero_grad()
 
-            self.state.global_step += 1
-            self.state.epoch = (step + 1) / max(num_protein_seq_steps_per_epoch, 1) if num_protein_seq_steps_per_epoch > 0 else 0
+                if optimizer_was_run or self.deepspeed:
+                    self.state.global_step += 1
 
-            if args.save_steps > 0 and self.state.global_step % args.save_steps == 0:
-                self._save_checkpoint()
+                    if args.local_rank == -1 or args.local_rank == 0:
+                        all_loss = dict(all_loss)
+                        all_loss['global_step'] = int(self.state.global_step)
+                        all_loss['learning_rate'] = self.get_learning_rate()
+                        logger.info("loss and lr dict: %s", str(all_loss))
+                        print(all_loss)
+                        self.loss_recorder.append(all_loss)
+                        self._append_loss_trace(all_loss)
+
+                    if args.save_steps > 0 and self.state.global_step % args.save_steps == 0:
+                        self._save_checkpoint()
 
             # print("forward propagation time",time.time()-tempt)
         
@@ -716,15 +728,51 @@ class GLProteinTrainer(Trainer):
             self.state.save_to_json(os.path.join(output_dir, 'trainer_state.json'))
             self._save_rng_state(output_dir)
 
-        # save loss traces.
-        with open(os.path.join(output_dir, 'loss_trace.json'), 'w', encoding='utf-8') as handle:
-            handle.write(json.dumps(self.loss_recorder, indent=2, ensure_ascii=False))
+        # save recent loss traces without retaining the full run in RAM.
+        recent_loss_trace = list(self.loss_recorder)
+        with open(os.path.join(output_dir, 'loss_trace_recent.json'), 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(recent_loss_trace, indent=2, ensure_ascii=False))
         self._write_loss_trace_csv(output_dir)
-        # keep latest copies in output_dir for easier visualization
-        with open(os.path.join(self.args.output_dir, 'loss_trace.json'), 'w', encoding='utf-8') as handle:
-            handle.write(json.dumps(self.loss_recorder, indent=2, ensure_ascii=False))
+        latest_recent_path = os.path.join(self.args.output_dir, 'loss_trace_recent.json')
+        with open(latest_recent_path, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(recent_loss_trace, indent=2, ensure_ascii=False))
         self._write_loss_trace_csv(self.args.output_dir)
+        self._write_checkpoint_metadata(output_dir)
+        self._verify_checkpoint_integrity(output_dir)
         self._rotate_checkpoints()
+
+    def _write_checkpoint_metadata(self, output_dir: str) -> None:
+        metadata = {
+            'format_version': 1,
+            'global_step': int(self.state.global_step),
+            'is_full_glprotein_checkpoint': True,
+            'contains_optimizer_state': bool(self.deepspeed or self.optimizer is not None),
+            'contains_scheduler_state': bool(self.deepspeed or self.lr_scheduler is not None),
+            'contains_rng_state': True,
+            'contains_recent_loss_trace': True,
+            'step_semantics': 'optimizer_update_step',
+            'loss_trace_policy': 'recent_window_only',
+            'full_loss_trace_path_relative': 'loss_trace.jsonl',
+        }
+        with open(os.path.join(output_dir, 'checkpoint_meta.json'), 'w', encoding='utf-8') as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False)
+
+    def _verify_checkpoint_integrity(self, output_dir: str) -> None:
+        required_paths = [
+            os.path.join(output_dir, 'encoder'),
+            os.path.join(output_dir, 'decoder'),
+            os.path.join(output_dir, 'glprotein_config.json'),
+            os.path.join(output_dir, 'checkpoint_meta.json'),
+            os.path.join(output_dir, 'training_args.bin'),
+            os.path.join(output_dir, 'trainer_state.json'),
+        ]
+        missing = [path for path in required_paths if not os.path.exists(path)]
+        if missing:
+            raise RuntimeError(f'Checkpoint save incomplete; missing paths: {missing}')
+        if not self.deepspeed and self.optimizer is not None and not os.path.exists(os.path.join(output_dir, 'optimizer.pt')):
+            raise RuntimeError('Checkpoint save incomplete; optimizer.pt is missing.')
+        if not self.deepspeed and self.lr_scheduler is not None and not os.path.exists(os.path.join(output_dir, 'scheduler.pt')):
+            raise RuntimeError('Checkpoint save incomplete; scheduler.pt is missing.')
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
@@ -734,8 +782,10 @@ class GLProteinTrainer(Trainer):
         # Save a trained model and configuration using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
         self.model.save_pretrained(output_dir, state_dict=state_dict)
-        # if self.tokenizer is not None:
-        #     self.tokenizer.save_pretrained(output_dir)
+        if self.protein_tokenizer is not None:
+            self.protein_tokenizer.save_pretrained(os.path.join(output_dir, 'protein_tokenizer'))
+        if self.text_tokenizer is not None and getattr(self.args, 'save_text_tokenizer', True):
+            self.text_tokenizer.save_pretrained(os.path.join(output_dir, 'text_tokenizer'))
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
@@ -1089,11 +1139,6 @@ class GLProteinTrainer(Trainer):
         Setup the scheduler. The optimizer must have been set up before this method is called.
         """
         if self.lr_scheduler is None:
-            if self.args.deepspeed:
-                num_training_steps = num_training_steps // self.args.gradient_accumulation_steps + int(
-                    num_training_steps % self.args.gradient_accumulation_steps > 0
-                )
-
             self.lr_scheduler = get_scheduler(
                 self.args.lr_scheduler_type,
                 optimizer if optimizer is not None else self.optimizer,

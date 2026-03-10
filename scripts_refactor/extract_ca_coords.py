@@ -46,6 +46,11 @@ from typing import Any
 
 import numpy as np
 
+from coordinate_store import (
+    export_coordinate_shards_from_temp_shards,
+    normalize_coordinate_array,
+)
+
 # Suppress noisy BioPython warnings (e.g. discontinuous chains)
 warnings.filterwarnings("ignore")
 
@@ -247,12 +252,12 @@ def dedupe_tsv_files(files: list[Path]) -> tuple[list[Path], int, list[str]]:
     return deduped, dropped, dropped_examples
 
 
-def default_checkpoint_path(output_path: Path) -> Path:
-    return Path(str(output_path) + ".checkpoint.pkl")
+def default_checkpoint_path(output_target: Path) -> Path:
+    return Path(str(output_target) + ".checkpoint.pkl")
 
 
-def default_shard_dir(output_path: Path) -> Path:
-    return Path(str(output_path) + ".shards")
+def default_shard_dir(output_target: Path) -> Path:
+    return Path(str(output_target) + ".shards")
 
 
 def save_pickle_atomic(path: Path, obj: Any) -> None:
@@ -275,13 +280,6 @@ def load_checkpoint(checkpoint_path: Path) -> dict[str, Any]:
     return state
 
 
-def normalize_coords(coords: list[list[float]]) -> np.ndarray:
-    arr = np.asarray(coords, dtype=np.float32)
-    if arr.ndim != 2 or arr.shape[1] != 3:
-        raise ValueError(f"Coordinates must have shape [L,3], got {arr.shape}")
-    return arr
-
-
 def compute_candidate_hash(files: list[Path]) -> str:
     h = hashlib.sha256()
     for path in files:
@@ -302,6 +300,8 @@ def config_fingerprint(
     return {
         "input_dir": str(args.input_dir.resolve()),
         "output": str(args.output.resolve()),
+        "output_format": args.output_format,
+        "coordinate_format": getattr(args, "coordinate_format", None),
         "key_mode": args.key_mode,
         "fasta": str(args.fasta.resolve()) if args.fasta else None,
         "triplets_tsv": str(args.triplets_tsv.resolve()) if args.triplets_tsv else None,
@@ -363,26 +363,46 @@ def checkpoint_state(
     }
 
 
-def merge_shards_to_output(shard_dir: Path, shard_paths: list[str], buffer_result: dict[Any, np.ndarray], output_path: Path) -> int:
-    final_result: dict[Any, np.ndarray] = {}
-    for shard_name in shard_paths:
-        shard_path = shard_dir / shard_name
-        if not shard_path.exists():
-            raise FileNotFoundError(f"Expected shard file missing during final merge: {shard_path}")
-        with open(shard_path, "rb") as fh:
-            shard_data = pickle.load(fh)
-        if not isinstance(shard_data, dict):
-            raise ValueError(f"Shard {shard_path} does not contain a dict")
-        final_result.update(shard_data)
-        del shard_data
-    if buffer_result:
-        final_result.update(buffer_result)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_pickle_atomic(output_path, final_result)
-    count = len(final_result)
-    del final_result
+def finalize_output(
+    *,
+    output_format: str,
+    shard_dir: Path,
+    shard_paths: list[str],
+    buffer_result: dict[Any, np.ndarray],
+    output: Path,
+    coordinate_format: str,
+) -> tuple[int, str | None]:
+    if output_format == "pkl":
+        final_result: dict[Any, np.ndarray] = {}
+        for shard_name in shard_paths:
+            shard_path = shard_dir / shard_name
+            if not shard_path.exists():
+                raise FileNotFoundError(f"Expected shard file missing during final merge: {shard_path}")
+            with open(shard_path, "rb") as fh:
+                shard_data = pickle.load(fh)
+            if not isinstance(shard_data, dict):
+                raise ValueError(f"Shard {shard_path} does not contain a dict")
+            final_result.update(shard_data)
+            del shard_data
+        if buffer_result:
+            final_result.update(buffer_result)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        save_pickle_atomic(output, final_result)
+        count = len(final_result)
+        del final_result
+        gc.collect()
+        return count, None
+
+    count, index_path = export_coordinate_shards_from_temp_shards(
+        temp_shard_dir=shard_dir,
+        shard_paths=shard_paths,
+        buffered_records=buffer_result,
+        output_dir=output,
+        fmt=coordinate_format,
+        reset_output_dir=False,
+    )
     gc.collect()
-    return count
+    return count, index_path
 
 
 def remove_shard_dir(shard_dir: Path) -> None:
@@ -397,7 +417,19 @@ def remove_shard_dir(shard_dir: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input-dir", required=True, type=Path, help="Folder containing .pdb / .pdb.gz / .cif / .cif.gz files")
-    parser.add_argument("--output", required=True, type=Path, help="Output .pkl path")
+    parser.add_argument("--output", required=True, type=Path, help="Output path. For --output-format pkl this is the final .pkl path; for --output-format sharded this is the final coordinate directory.")
+    parser.add_argument(
+        "--output-format",
+        choices=["pkl", "sharded"],
+        default="pkl",
+        help="Final coordinate output format. Use sharded to write the low-memory coordinate store directly instead of creating a merged PKL.",
+    )
+    parser.add_argument(
+        "--coordinate-format",
+        choices=["npy", "pkl"],
+        default="npy",
+        help="Per-record file format for --output-format sharded (default: npy). Ignored for --output-format pkl.",
+    )
     parser.add_argument(
         "--key-mode",
         choices=["index", "tsv_id"],
@@ -486,6 +518,8 @@ def main():
         sys.exit("--log-every must be > 0")
     if args.flush_every <= 0:
         sys.exit("--flush-every must be > 0")
+    if args.output_format == "pkl" and args.output.suffix.lower() != ".pkl":
+        print(f"[warn] --output-format pkl usually writes to a .pkl path, got {args.output}")
 
     files = collect_structure_files(args.input_dir)
     if not files:
@@ -661,7 +695,7 @@ def main():
                     failed.append(path.name)
                     processed_files.add(file_token)
                 else:
-                    coords_arr = normalize_coords(coords)
+                    coords_arr = normalize_coordinate_array(coords)
                     if protein_key in seen_keys:
                         overwritten += 1
                         if len(overwrite_examples) < 10:
@@ -737,8 +771,20 @@ def main():
         f"skipped={skipped} failed={len(failed)} | shards={len(shard_paths)} | elapsed={elapsed:.1f}s"
     )
 
-    unique_key_count = merge_shards_to_output(shard_dir, shard_paths, buffer_result, args.output)
-    print(f"\nSaved {unique_key_count} unique protein keys -> {args.output}")
+    unique_key_count, index_path = finalize_output(
+        output_format=args.output_format,
+        shard_dir=shard_dir,
+        shard_paths=shard_paths,
+        buffer_result=buffer_result,
+        output=args.output,
+        coordinate_format=args.coordinate_format,
+    )
+    if args.output_format == "pkl":
+        print(f"\nSaved {unique_key_count} unique protein keys -> {args.output}")
+    else:
+        print(f"\nSaved {unique_key_count} unique protein keys -> shard directory {args.output}")
+        if index_path is not None:
+            print(f"Index written to {index_path}")
     if overwrite_examples:
         print("Overwrite examples: " + "; ".join(overwrite_examples[:10]))
     if failed:
@@ -769,7 +815,8 @@ def main():
             "first_missing_no_file_anchor_ids": anchors_missing_no_file[:20],
             "first_failed_after_match_anchor_ids": anchors_failed_after_match[:20],
         }
-        coverage_path = args.coverage_report or Path(str(args.output) + ".coverage.json")
+        default_coverage_path = (args.output / "_coverage.json") if args.output_format == "sharded" else Path(str(args.output) + ".coverage.json")
+        coverage_path = args.coverage_report or default_coverage_path
         coverage_path.parent.mkdir(parents=True, exist_ok=True)
         with open(coverage_path, "w", encoding="utf-8") as fh:
             json.dump(coverage_report, fh, indent=2, ensure_ascii=False)

@@ -197,6 +197,10 @@ class KMAETrainingArguments(TrainingArguments):
         default=0,
         metadata={"help": "Optional padded-token budget for protein sequence batches. 0 disables token-budget batching."}
     )
+    loss_trace_max_history: int = field(
+        default=1000,
+        metadata={"help": "Maximum number of recent loss records kept in memory and checkpoint summaries. The full append-only JSONL trace is still written to output_dir."}
+    )
 
     # respectively set learning rate to training of protein language model and knowledge embedding
     lm_learning_rate: float = field(
@@ -263,9 +267,21 @@ class KMAETrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Path to a checkpoint directory to resume training from."}
     )
+    model_checkpoint_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a saved GLProtein checkpoint directory to load model weights from without optimizer/scheduler resume."}
+    )
+    load_full_glprotein_checkpoint: bool = field(
+        default=True,
+        metadata={"help": "Whether to prefer loading a self-contained GLProtein checkpoint directory when available."}
+    )
     auto_resume_from_latest: bool = field(
         default=False,
         metadata={"help": "Automatically resume from the latest checkpoint under output_dir if available."}
+    )
+    save_text_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to save the text tokenizer alongside checkpoints when available."}
     )
 
     adafactor: bool = field(
@@ -432,9 +448,24 @@ class DataArguments:
         metadata={"help": "Optional path to pickled AlphaFold alpha-carbon coordinates."}
     )
 
+    coordinates_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional directory of sharded per-anchor coordinate files (.npy/.pkl). Use instead of coordinates_path to avoid loading the full coordinate PKL into RAM."}
+    )
+
+    coordinate_cache_size: int = field(
+        default=128,
+        metadata={"help": "Number of recently used coordinate shards to keep cached in RAM when coordinates_dir is used. 0 disables caching."}
+    )
+
     aa_vec_model_path: Optional[str] = field(
         default=None,
         metadata={"help": "Optional path to the mol2vec model used for amino-acid molecular encodings."}
+    )
+
+    aa_vec_vocab_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to a tiny precomputed amino-acid vocab file (.pkl/.json/.npy). Use instead of aa_vec_model_path to avoid loading the full mol2vec model at training startup."}
     )
 
     filter_triplets_to_coordinate_coverage: bool = field(

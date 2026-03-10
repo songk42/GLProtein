@@ -41,27 +41,22 @@ def _collate_batch_for_protein_cor(
         are_protein_length_same: bool
 ):
     if isinstance(examples[0], ProteinGoInputFeatures):
-        examples = [torch.tensor(e.coordinates, dtype=torch.float) for e in examples]
+        examples = [torch.as_tensor(np.asarray(e.coordinates, dtype=np.float32)) for e in examples]
     elif isinstance(examples[0], ProteinSeqTripletInputFeatures):
-        examples = [torch.tensor(np.array(e.anchor_coordinates), dtype=torch.float) for e in examples]
+        examples = [torch.from_numpy(np.asarray(e.anchor_coordinates, dtype=np.float32)) for e in examples]
     elif isinstance(examples[0], dict) and 'coordinates' in examples[0]:
-        examples = [torch.tensor(np.array(e['coordinates']), dtype=torch.float) for e in examples]
+        examples = [torch.as_tensor(np.asarray(e['coordinates'], dtype=np.float32)) for e in examples]
 
     if are_protein_length_same:
         return torch.stack(examples, dim=0)
 
     max_length = max(x.size(0) for x in examples)
-    result = np.full((len(examples),max_length, 3),float('-inf'))
+    result = torch.full((len(examples), max_length, 3), float('-inf'), dtype=torch.float32)
     for i, example in enumerate(examples):
         if tokenizer.padding_side == 'right':
-            result[i][:example.size(0)] = example
+            result[i, :example.size(0)] = example
         else:
-            result[i][-example.size(0):] = example
-
-
-    result = torch.tensor(result, dtype=torch.float)
-
-
+            result[i, -example.size(0):] = example
     return result
 
 
@@ -71,31 +66,23 @@ def _collate_batch_for_aa_vec(
         are_protein_length_same: bool
 ):
     if isinstance(examples[0], ProteinGoInputFeatures):
-        examples = [torch.tensor(np.array(e.aa_vec), dtype=torch.float) for e in examples]
+        examples = [torch.as_tensor(np.asarray(e.aa_vec, dtype=np.float32)) for e in examples]
     elif isinstance(examples[0], ProteinSeqTripletInputFeatures):
-        examples = [torch.tensor(np.array(e.anchor_aa_vec), dtype=torch.float) for e in examples]
+        examples = [torch.from_numpy(np.asarray(e.anchor_aa_vec, dtype=np.float32)) for e in examples]
     elif isinstance(examples[0], dict) and 'aa_vec' in examples[0]:
-        examples = [torch.tensor(np.array(e['aa_vec']), dtype=torch.float) for e in examples]
-
-
+        examples = [torch.as_tensor(np.asarray(e['aa_vec'], dtype=np.float32)) for e in examples]
 
     if are_protein_length_same:
         return torch.stack(examples, dim=0)
 
+    feature_dim = int(examples[0].size(-1)) if examples else 0
     max_length = max(x.size(0) for x in examples)
-    result = np.full((len(examples),max_length, 300),float(0))
- 
+    result = torch.zeros((len(examples), max_length, feature_dim), dtype=torch.float32)
     for i, example in enumerate(examples):
         if tokenizer.padding_side == 'right':
-            result[i][:example.size(0)] = example
+            result[i, :example.size(0)] = example
         else:
-            result[i][-example.size(0):] = example
-
-    
-
-    result = torch.tensor(result, dtype=torch.float)
-
-
+            result[i, -example.size(0):] = example
     return result
 
 

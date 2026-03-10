@@ -11,12 +11,15 @@ import numpy as np
 import pickle as pkl
 import dataclasses
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
+from collections import OrderedDict
+from urllib.parse import quote
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 from scipy.spatial import distance_matrix
 import pickle
 import csv
+import glob
 # from .prediction import prediction
 import numpy as np
 import math as m
@@ -767,10 +770,54 @@ class ProteinSeqTripletInputFeatures:
     negative_id: Optional[str] = None
     positive_score: Optional[float] = None
     negative_score: Optional[float] = None
-    anchor_coordinates: Optional[List[List[float]]] = None
-    anchor_aa_vec: Optional[List[List[float]]] = None
+    anchor_coordinates: Optional[Any] = None
+    anchor_aa_vec: Optional[Any] = None
 
 
+
+
+def _normalize_aa_vocab(aa_vocab: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    normalized: Dict[str, np.ndarray] = {}
+    for key, value in aa_vocab.items():
+        residue = str(key).strip().upper()
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim != 1:
+            raise ValueError(f"AA vocab entry for {key!r} must be 1D, got shape {arr.shape}")
+        normalized[residue] = arr.astype(np.float32, copy=False)
+    required = {"X"}
+    if not required.issubset(normalized.keys()):
+        missing = sorted(required - set(normalized.keys()))
+        raise ValueError(f"AA vocab is missing required residue codes: {missing}")
+    return normalized
+
+
+def _load_aa_vocab_from_file(vocab_path: str) -> Dict[str, np.ndarray]:
+    ext = os.path.splitext(vocab_path)[1].lower()
+    if ext in {'.pkl', '.pickle'}:
+        with open(vocab_path, 'rb') as fh:
+            payload = pickle.load(fh)
+    elif ext == '.json':
+        with open(vocab_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+    elif ext == '.npy':
+        payload = np.load(vocab_path, allow_pickle=True)
+        if isinstance(payload, np.ndarray) and payload.dtype == object and payload.shape == ():
+            payload = payload.item()
+        elif isinstance(payload, np.ndarray) and payload.ndim == 0:
+            payload = payload.item()
+    else:
+        raise ValueError(f"Unsupported aa_vec_vocab_path extension for {vocab_path}. Use .pkl, .pickle, .json, or .npy")
+    if not isinstance(payload, dict):
+        raise ValueError(f"AA vocab file must contain a dict[str, vector]; got {type(payload).__name__}")
+    aa_vocab = _normalize_aa_vocab(payload)
+    first_dim = int(next(iter(aa_vocab.values())).shape[0])
+    logger.info(
+        "Loaded precomputed amino-acid vocabulary from %s with %d residue codes and vector dim %d",
+        vocab_path,
+        len(aa_vocab),
+        first_dim,
+    )
+    return aa_vocab
 
 
 def _build_aa_vocab_from_mol2vec(model_path: str) -> Dict[str, List[float]]:
@@ -789,10 +836,10 @@ def _build_aa_vocab_from_mol2vec(model_path: str) -> Dict[str, List[float]]:
         raise ValueError(
             f"Unexpected amino-acid mol2vec shape from {model_path}: got {aa_vecs.shape}, expected ({len(aa_codes)}, vector_dim)"
         )
-    aa_vocab = {aa: aa_vecs[i].tolist() for i, aa in enumerate(aa_codes)}
-    aa_vocab['B'] = ((aa_vecs[aa_codes.index('D')] + aa_vecs[aa_codes.index('N')]) / 2.0).tolist()
-    aa_vocab['Z'] = ((aa_vecs[aa_codes.index('E')] + aa_vecs[aa_codes.index('Q')]) / 2.0).tolist()
-    aa_vocab['X'] = np.mean(np.asarray(list(aa_vocab.values()), dtype=np.float32), axis=0).tolist()
+    aa_vocab = {aa: np.asarray(aa_vecs[i], dtype=np.float32) for i, aa in enumerate(aa_codes)}
+    aa_vocab['B'] = np.asarray((aa_vecs[aa_codes.index('D')] + aa_vecs[aa_codes.index('N')]) / 2.0, dtype=np.float32)
+    aa_vocab['Z'] = np.asarray((aa_vecs[aa_codes.index('E')] + aa_vecs[aa_codes.index('Q')]) / 2.0, dtype=np.float32)
+    aa_vocab['X'] = np.mean(np.asarray(list(aa_vocab.values()), dtype=np.float32), axis=0, dtype=np.float32)
     logger.info(
         "Loaded mol2vec amino-acid vocabulary from %s with %d residue codes and vector dim %d",
         model_path,
@@ -836,29 +883,44 @@ class ProteinSeqTripletDataset(Dataset):
         max_protein_seq_length: Optional[int] = None,
         protein_seq_sample_limit: Optional[int] = None,
         coordinates_path: Optional[str] = None,
+        coordinates_dir: Optional[str] = None,
         aa_vec_model_path: Optional[str] = None,
+        aa_vec_vocab_path: Optional[str] = None,
+        coordinate_cache_size: int = 128,
         filter_triplets_to_coordinate_coverage: bool = False,
         filtered_triplets_output_tsv: Optional[str] = None,
         min_triplet_retention_ratio: float = 0.0,
         triplet_filter_report_path: Optional[str] = None,
     ):
-        def trans_sequence(sequence: str) -> str:
-            sequence = " ".join(sequence.strip())
-            sequence = re.sub(r"[UZOB]", "X", sequence)
-            return sequence
         self.data_dir = data_dir
         self.triplets_tsv = triplets_tsv
         self.tokenizer = tokenizer
         self.max_protein_seq_length = max_protein_seq_length
         self.coordinates_path = coordinates_path
+        self.coordinates_dir = coordinates_dir
         self.aa_vec_model_path = aa_vec_model_path
+        self.aa_vec_vocab_path = aa_vec_vocab_path
+        self.coordinate_cache_size = max(0, int(coordinate_cache_size))
         self.filter_triplets_to_coordinate_coverage = bool(filter_triplets_to_coordinate_coverage)
         self.filtered_triplets_output_tsv = filtered_triplets_output_tsv
         self.min_triplet_retention_ratio = float(min_triplet_retention_ratio)
         self.triplet_filter_report_path = triplet_filter_report_path
         self._triplet_filter_report = None
         self.protein_cor = None
+        self.coordinate_index: Optional[Dict[str, str]] = None
+        self._coordinate_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self.aa_vocab = None
+        self.aa_vec_dim: int = 300
+        self.row_offsets: List[int] = []
+        self.example_lengths: List[int] = []
+        self._triplet_headers: Optional[List[str]] = None
+        self._has_triplet_header = False
+        self._token_id_to_residue: Dict[int, Optional[str]] = {}
+
+        if coordinates_path is not None and coordinates_dir is not None:
+            raise ValueError("Provide only one of coordinates_path or coordinates_dir, not both")
+        if aa_vec_model_path is not None and aa_vec_vocab_path is not None:
+            raise ValueError("Provide only one of aa_vec_model_path or aa_vec_vocab_path, not both")
         if coordinates_path is not None:
             if not os.path.isabs(coordinates_path):
                 coordinates_path = os.path.join(self.data_dir, coordinates_path)
@@ -866,12 +928,27 @@ class ProteinSeqTripletDataset(Dataset):
                 raise FileNotFoundError(f"Coordinates file not found: {coordinates_path}")
             with open(coordinates_path, 'rb') as f:
                 self.protein_cor = pickle.load(f)
-        if aa_vec_model_path is not None:
+        elif coordinates_dir is not None:
+            if not os.path.isabs(coordinates_dir):
+                coordinates_dir = os.path.join(self.data_dir, coordinates_dir)
+            if not os.path.isdir(coordinates_dir):
+                raise FileNotFoundError(f"Coordinate shard directory not found: {coordinates_dir}")
+            self.coordinates_dir = coordinates_dir
+            self.coordinate_index = self._load_coordinate_index(coordinates_dir)
+        if aa_vec_vocab_path is not None:
+            if not os.path.isabs(aa_vec_vocab_path):
+                aa_vec_vocab_path = os.path.join(self.data_dir, aa_vec_vocab_path)
+            if not os.path.exists(aa_vec_vocab_path):
+                raise FileNotFoundError(f"AA vec vocab file not found: {aa_vec_vocab_path}")
+            self.aa_vocab = _load_aa_vocab_from_file(aa_vec_vocab_path)
+        elif aa_vec_model_path is not None:
             if not os.path.isabs(aa_vec_model_path):
                 aa_vec_model_path = os.path.join(self.data_dir, aa_vec_model_path)
             if not os.path.exists(aa_vec_model_path):
                 raise FileNotFoundError(f"AA vec model not found: {aa_vec_model_path}")
             self.aa_vocab = _build_aa_vocab_from_mol2vec(aa_vec_model_path)
+        if self.aa_vocab is not None:
+            self.aa_vec_dim = int(next(iter(self.aa_vocab.values())).shape[0])
         if not os.path.isabs(self.triplets_tsv):
             self.triplets_tsv = os.path.join(self.data_dir, self.triplets_tsv)
         if not os.path.exists(self.triplets_tsv):
@@ -882,74 +959,234 @@ class ProteinSeqTripletDataset(Dataset):
             self.triplet_filter_report_path = os.path.join(self.data_dir, self.triplet_filter_report_path)
         if not 0.0 <= self.min_triplet_retention_ratio <= 1.0:
             raise ValueError("min_triplet_retention_ratio must be in [0,1]")
-        self.triplets = []
-        with open(self.triplets_tsv, "r", encoding="utf-8") as f:
-            first_line = f.readline()
+
+        self._scan_triplet_rows(protein_seq_sample_limit=protein_seq_sample_limit)
+        if len(self.row_offsets) == 0:
+            raise ValueError("No triplets loaded from TSV")
+        self._validate_triplets_against_local_structure()
+
+    @staticmethod
+    def _trans_sequence(sequence: str) -> str:
+        sequence = " ".join(sequence.strip())
+        sequence = re.sub(r"[UZOB]", "X", sequence)
+        return sequence
+
+    def _parse_triplet_parts(self, parts: List[str], headers: Optional[List[str]]) -> Dict[str, Optional[Union[str, float]]]:
+        parts = [x.strip() for x in parts]
+        if headers is None:
+            if len(parts) < 3:
+                raise ValueError("Triplet TSV rows must have at least 3 columns")
+            row = {
+                "anchor_seq": parts[0],
+                "positive_seq": parts[1],
+                "negative_seq": parts[2],
+                "anchor_id": None,
+                "positive_id": None,
+                "negative_id": None,
+                "positive_score": None,
+                "negative_score": None,
+            }
+        else:
+            raw_row = {h: (parts[i] if i < len(parts) else "") for i, h in enumerate(headers)}
+            row = {
+                "anchor_seq": raw_row.get("anchor_seq", ""),
+                "positive_seq": raw_row.get("positive_seq", ""),
+                "negative_seq": raw_row.get("negative_seq", ""),
+                "anchor_id": raw_row.get("anchor_id") or None,
+                "positive_id": raw_row.get("positive_id") or None,
+                "negative_id": raw_row.get("negative_id") or None,
+                "positive_score": raw_row.get("positive_score") or None,
+                "negative_score": raw_row.get("negative_score") or None,
+            }
+        row["anchor_seq"] = self._trans_sequence(str(row["anchor_seq"]))
+        row["positive_seq"] = self._trans_sequence(str(row["positive_seq"]))
+        row["negative_seq"] = self._trans_sequence(str(row["negative_seq"]))
+        if row.get("positive_score") not in (None, ""):
+            row["positive_score"] = float(row["positive_score"])
+        else:
+            row["positive_score"] = None
+        if row.get("negative_score") not in (None, ""):
+            row["negative_score"] = float(row["negative_score"])
+        else:
+            row["negative_score"] = None
+        return row
+
+    def _read_row_at_offset(self, offset: int) -> Dict[str, Optional[Union[str, float]]]:
+        with open(self.triplets_tsv, "r", encoding="utf-8") as fh:
+            fh.seek(offset)
+            line = fh.readline()
+        if not line:
+            raise IndexError(f"Triplet row offset {offset} is invalid for {self.triplets_tsv}")
+        return self._parse_triplet_parts(line.rstrip("\n").split("\t"), headers=self._triplet_headers)
+
+    def _iter_scanned_rows(self):
+        for row_idx, offset in enumerate(self.row_offsets):
+            yield row_idx, offset, self._read_row_at_offset(offset)
+
+    def _load_coordinate_index(self, coordinates_dir: str) -> Optional[Dict[str, str]]:
+        candidate_names = [
+            '_index.json',
+            'index.json',
+            'coordinate_index.json',
+        ]
+        for name in candidate_names:
+            index_path = os.path.join(coordinates_dir, name)
+            if not os.path.exists(index_path):
+                continue
+            with open(index_path, 'r', encoding='utf-8') as fh:
+                payload = json.load(fh)
+            if not isinstance(payload, dict):
+                raise ValueError(f"Coordinate index at {index_path} must contain a JSON object mapping anchor_id to filename")
+            index: Dict[str, str] = {}
+            for key, value in payload.items():
+                if value is None:
+                    continue
+                rel = str(value)
+                full = rel if os.path.isabs(rel) else os.path.join(coordinates_dir, rel)
+                index[str(key)] = full
+            logger.info("Loaded coordinate shard index from %s with %d anchors", index_path, len(index))
+            return index
+        logger.info("No coordinate shard index found in %s; falling back to filename probing", coordinates_dir)
+        return None
+
+    def _candidate_coordinate_paths(self, protein_id: str) -> List[str]:
+        if self.coordinates_dir is None:
+            return []
+        candidates: List[str] = []
+        if self.coordinate_index is not None:
+            indexed = self.coordinate_index.get(protein_id)
+            if indexed:
+                candidates.append(indexed)
+                return candidates
+        safe_id = quote(protein_id, safe='')
+        hashed = hashlib.sha256(protein_id.encode('utf-8')).hexdigest()
+        for stem in [protein_id, safe_id, hashed]:
+            for ext in ['.npy', '.pkl', '.pickle']:
+                candidates.append(os.path.join(self.coordinates_dir, stem + ext))
+        return candidates
+
+    def _has_coordinate_coverage(self, protein_id: Optional[str]) -> bool:
+        if not protein_id:
+            return False
+        if self.protein_cor is not None:
+            return protein_id in self.protein_cor
+        if self.coordinates_dir is None:
+            return False
+        if self.coordinate_index is not None:
+            return protein_id in self.coordinate_index and os.path.exists(self.coordinate_index[protein_id])
+        return any(os.path.exists(path) for path in self._candidate_coordinate_paths(protein_id))
+
+    def _load_coordinate_array(self, protein_id: str) -> Optional[np.ndarray]:
+        if self.protein_cor is not None:
+            value = self.protein_cor.get(protein_id)
+            return None if value is None else np.asarray(value, dtype=np.float32)
+        if self.coordinates_dir is None:
+            return None
+        cached = self._coordinate_cache.get(protein_id)
+        if cached is not None:
+            self._coordinate_cache.move_to_end(protein_id)
+            return cached
+        coord_path = None
+        for candidate in self._candidate_coordinate_paths(protein_id):
+            if os.path.exists(candidate):
+                coord_path = candidate
+                break
+        if coord_path is None:
+            return None
+        ext = os.path.splitext(coord_path)[1].lower()
+        if ext == '.npy':
+            arr = np.load(coord_path, allow_pickle=False)
+        elif ext in {'.pkl', '.pickle'}:
+            with open(coord_path, 'rb') as fh:
+                arr = pickle.load(fh)
+        else:
+            raise ValueError(f"Unsupported coordinate shard extension for {coord_path}")
+        arr = np.asarray(arr, dtype=np.float32)
+        self._coordinate_cache[protein_id] = arr
+        if self.coordinate_cache_size > 0:
+            while len(self._coordinate_cache) > self.coordinate_cache_size:
+                self._coordinate_cache.popitem(last=False)
+        elif self._coordinate_cache:
+            self._coordinate_cache.clear()
+        return arr
+
+    def _scan_triplet_rows(self, protein_seq_sample_limit: Optional[int]) -> None:
+        row_offsets: List[int] = []
+        example_lengths: List[int] = []
+        with open(self.triplets_tsv, "r", encoding="utf-8") as fh:
+            first_offset = fh.tell()
+            first_line = fh.readline()
             if not first_line:
                 raise ValueError("Triplet TSV is empty")
             first_parts = [x.strip() for x in first_line.rstrip("\n").split("\t")]
-            has_header = {"anchor_seq", "positive_seq", "negative_seq"}.issubset(set(first_parts))
-            def _parse_parts(parts, headers=None):
-                if headers is None:
-                    if len(parts) < 3:
-                        raise ValueError("Triplet TSV rows must have at least 3 columns")
-                    return {
-                        "anchor_seq": parts[0].strip(),
-                        "positive_seq": parts[1].strip(),
-                        "negative_seq": parts[2].strip(),
-                    }
-                row = {h: (parts[i].strip() if i < len(parts) else "") for i, h in enumerate(headers)}
-                return row
-            if has_header:
-                headers = first_parts
-            else:
-                headers = None
-                row = _parse_parts(first_parts, headers=None)
-                self.triplets.append({
-                    "anchor_seq": trans_sequence(row["anchor_seq"]),
-                    "positive_seq": trans_sequence(row["positive_seq"]),
-                    "negative_seq": trans_sequence(row["negative_seq"]),
-                    "anchor_id": None,
-                    "positive_id": None,
-                    "negative_id": None,
-                    "positive_score": None,
-                    "negative_score": None,
-                })
-            for line in f:
-                line = line.strip()
+            self._has_triplet_header = {"anchor_seq", "positive_seq", "negative_seq"}.issubset(set(first_parts))
+            self._triplet_headers = first_parts if self._has_triplet_header else None
+
+            def _maybe_add_row(offset: int, row_dict: Dict[str, Optional[Union[str, float]]]) -> bool:
+                row_offsets.append(offset)
+                example_lengths.append(max(
+                    len(str(row_dict["anchor_seq"]).split()),
+                    len(str(row_dict["positive_seq"]).split()),
+                    len(str(row_dict["negative_seq"]).split()),
+                ))
+                return protein_seq_sample_limit is not None and len(row_offsets) >= int(protein_seq_sample_limit)
+
+            if not self._has_triplet_header:
+                row = self._parse_triplet_parts(first_line.rstrip("\n").split("\t"), headers=None)
+                if _maybe_add_row(first_offset, row):
+                    self.row_offsets = row_offsets
+                    self.example_lengths = example_lengths
+                    return
+
+            while True:
+                offset = fh.tell()
+                line = fh.readline()
                 if not line:
+                    break
+                if not line.strip():
                     continue
-                parts = line.split("	")
-                row = _parse_parts(parts, headers=headers)
-                self.triplets.append({
-                    "anchor_seq": trans_sequence(row["anchor_seq"]),
-                    "positive_seq": trans_sequence(row["positive_seq"]),
-                    "negative_seq": trans_sequence(row["negative_seq"]),
-                    "anchor_id": row.get("anchor_id") or None,
-                    "positive_id": row.get("positive_id") or None,
-                    "negative_id": row.get("negative_id") or None,
-                    "positive_score": float(row["positive_score"]) if row.get("positive_score") not in (None, "") else None,
-                    "negative_score": float(row["negative_score"]) if row.get("negative_score") not in (None, "") else None,
-                })
-        if protein_seq_sample_limit is not None:
-            self.triplets = self.triplets[:protein_seq_sample_limit]
-        if len(self.triplets) == 0:
-            raise ValueError("No triplets loaded from TSV")
-        self._validate_triplets_against_local_structure()
-        self.example_lengths = [
-            max(len(row['anchor_seq'].split()), len(row['positive_seq'].split()), len(row['negative_seq'].split()))
-            for row in self.triplets
-        ]
+                row = self._parse_triplet_parts(line.rstrip("\n").split("\t"), headers=self._triplet_headers)
+                if _maybe_add_row(offset, row):
+                    break
+
+        self.row_offsets = row_offsets
+        self.example_lengths = example_lengths
 
     def _validate_triplets_against_local_structure(self) -> None:
-        if self.protein_cor is None:
+        if self.protein_cor is None and self.coordinates_dir is None:
             return
 
-        original_row_count = len(self.triplets)
-        missing_anchor_rows = [i for i, row in enumerate(self.triplets) if not row.get('anchor_id')]
-        unique_anchor_ids = sorted({row['anchor_id'] for row in self.triplets if row.get('anchor_id')})
-        coord_keys = set(self.protein_cor.keys())
-        missing_anchor_ids = [anchor_id for anchor_id in unique_anchor_ids if anchor_id not in coord_keys]
+        original_row_count = len(self.row_offsets)
+        coord_keys = set(self.protein_cor.keys()) if self.protein_cor is not None else None
+        missing_anchor_rows: List[int] = []
+        unique_anchor_ids = set()
+        missing_anchor_ids = set()
+        retained_offsets: List[int] = []
+        retained_lengths: List[int] = []
+        dropped_missing_anchor_id_rows: List[int] = []
+        dropped_anchor_id_set = set()
+
+        for row_idx, (offset, example_length) in enumerate(zip(self.row_offsets, self.example_lengths)):
+            row = self._read_row_at_offset(offset)
+            anchor_id = row.get('anchor_id')
+            if anchor_id:
+                unique_anchor_ids.add(anchor_id)
+            else:
+                missing_anchor_rows.append(row_idx)
+
+            has_coverage = self._has_coordinate_coverage(anchor_id)
+            if bool(anchor_id) and not has_coverage:
+                missing_anchor_ids.add(anchor_id)
+
+            if self.filter_triplets_to_coordinate_coverage:
+                if not anchor_id:
+                    dropped_missing_anchor_id_rows.append(row_idx)
+                    continue
+                if not has_coverage:
+                    dropped_anchor_id_set.add(anchor_id)
+                    continue
+                retained_offsets.append(offset)
+                retained_lengths.append(example_length)
 
         if missing_anchor_rows or missing_anchor_ids:
             if not self.filter_triplets_to_coordinate_coverage:
@@ -958,27 +1195,14 @@ class ProteinSeqTripletDataset(Dataset):
                     raise ValueError(
                         f"coordinates_path requires anchor_id in every triplet row; missing in {len(missing_anchor_rows)} rows. First rows: {preview}"
                     )
-                preview = ', '.join(str(x) for x in missing_anchor_ids[:20])
+                preview = ', '.join(str(x) for x in sorted(missing_anchor_ids)[:20])
                 raise ValueError(
                     "Coordinate PKL is missing anchor IDs required by the triplet TSV. "
                     f"Unique TSV anchors: {len(unique_anchor_ids)}; found in PKL: {len(unique_anchor_ids) - len(missing_anchor_ids)}; "
                     f"missing: {len(missing_anchor_ids)}. First missing IDs: {preview}"
                 )
 
-            filtered_triplets = []
-            dropped_missing_anchor_id_rows = []
-            dropped_anchor_id_set = set()
-            for row_idx, row in enumerate(self.triplets):
-                anchor_id = row.get('anchor_id')
-                if not anchor_id:
-                    dropped_missing_anchor_id_rows.append(row_idx)
-                    continue
-                if anchor_id not in coord_keys:
-                    dropped_anchor_id_set.add(anchor_id)
-                    continue
-                filtered_triplets.append(row)
-
-            retained_rows = len(filtered_triplets)
+            retained_rows = len(retained_offsets)
             retention_ratio = (retained_rows / original_row_count) if original_row_count > 0 else 0.0
             if retained_rows == 0:
                 raise ValueError("Filtering triplets by coordinate coverage would remove all rows; cannot continue.")
@@ -988,8 +1212,13 @@ class ProteinSeqTripletDataset(Dataset):
                     f"Retention ratio: {retention_ratio:.4f}; minimum required: {self.min_triplet_retention_ratio:.4f}"
                 )
 
-            self.triplets = filtered_triplets
-            retained_anchor_ids = sorted({row['anchor_id'] for row in self.triplets if row.get('anchor_id')})
+            self.row_offsets = retained_offsets
+            self.example_lengths = retained_lengths
+            retained_anchor_ids = sorted({
+                self._read_row_at_offset(offset)['anchor_id']
+                for offset in self.row_offsets
+                if self._read_row_at_offset(offset).get('anchor_id')
+            })
             self._triplet_filter_report = {
                 'original_row_count': original_row_count,
                 'retained_row_count': retained_rows,
@@ -1025,11 +1254,13 @@ class ProteinSeqTripletDataset(Dataset):
                 logger.info("Wrote triplet filter report to %s", self.triplet_filter_report_path)
 
         sampled_warnings = []
-        sample_count = min(20, len(self.triplets))
-        for row in self.triplets[:sample_count]:
+        sample_count = min(20, len(self.row_offsets))
+        for row_idx in range(sample_count):
+            row = self._read_row_at_offset(self.row_offsets[row_idx])
             anchor_id = row['anchor_id']
-            seq_len = len(row['anchor_seq'].split())
-            coord_len = len(self.protein_cor[anchor_id]) if anchor_id in self.protein_cor else 0
+            seq_len = len(str(row['anchor_seq']).split())
+            coord_arr = self._load_coordinate_array(anchor_id) if anchor_id else None
+            coord_len = int(coord_arr.shape[0]) if coord_arr is not None else 0
             if seq_len > 0 and coord_len > 0 and coord_len < max(1, int(0.5 * seq_len)):
                 sampled_warnings.append((anchor_id, seq_len, coord_len))
         if sampled_warnings:
@@ -1038,9 +1269,10 @@ class ProteinSeqTripletDataset(Dataset):
 
         logger.info(
             "Validated triplet/local-structure inputs: %d rows, %d unique anchors, coordinate coverage OK.",
-            len(self.triplets),
-            len({row['anchor_id'] for row in self.triplets if row.get('anchor_id')}),
+            len(self.row_offsets),
+            len({self._read_row_at_offset(offset)['anchor_id'] for offset in self.row_offsets if self._read_row_at_offset(offset).get('anchor_id')}),
         )
+        self._coordinate_cache.clear()
 
     def _write_filtered_triplets_tsv(self, output_path: str) -> None:
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
@@ -1048,7 +1280,7 @@ class ProteinSeqTripletDataset(Dataset):
         with open(output_path, 'w', encoding='utf-8', newline='') as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter='	')
             writer.writeheader()
-            for row in self.triplets:
+            for _, _, row in self._iter_scanned_rows():
                 writer.writerow({k: ('' if row.get(k) is None else row.get(k)) for k in fieldnames})
 
     def _write_triplet_filter_report(self, output_path: str) -> None:
@@ -1057,7 +1289,7 @@ class ProteinSeqTripletDataset(Dataset):
             json.dump(self._triplet_filter_report or {}, fh, indent=2, ensure_ascii=False)
 
     def __len__(self) -> int:
-        return len(self.triplets)
+        return len(self.row_offsets)
 
     def get_example_length(self, index: int) -> int:
         length = int(self.example_lengths[index])
@@ -1070,12 +1302,14 @@ class ProteinSeqTripletDataset(Dataset):
             return seq
         return " ".join(seq.split()[: self.max_protein_seq_length])
 
-    def _build_coordinates(self, residue_count: int, protein_id: Optional[str]) -> List[List[float]]:
+    def _build_coordinates(self, residue_count: int, protein_id: Optional[str]) -> np.ndarray:
         if residue_count <= 0:
-            return []
-        if self.protein_cor is None or protein_id is None:
-            return np.zeros((residue_count, 3), dtype=np.float32).tolist()
-        cor = self.protein_cor[protein_id]
+            return np.zeros((0, 3), dtype=np.float32)
+        if protein_id is None:
+            return np.zeros((residue_count, 3), dtype=np.float32)
+        cor = self._load_coordinate_array(protein_id)
+        if cor is None:
+            return np.zeros((residue_count, 3), dtype=np.float32)
         cor = np.asarray(cor, dtype=np.float32)
         if cor.ndim != 2 or cor.shape[1] != 3:
             raise ValueError(f"Coordinates for {protein_id} must have shape [L,3]")
@@ -1085,18 +1319,21 @@ class ProteinSeqTripletDataset(Dataset):
             cor = np.concatenate([cor, pad], axis=0)
         valid = np.any(np.abs(cor) > 0, axis=1)
         if np.any(valid):
+            cor = cor.astype(np.float32, copy=False)
             cor[valid] = cor[valid] - cor[valid].mean(axis=0, keepdims=True)
-        return cor.tolist()
+        return cor.astype(np.float32, copy=False)
 
-    def _build_aa_vec(self, input_ids: List[int], residue_count: int) -> List[List[float]]:
+    def _build_aa_vec(self, input_ids: List[int], residue_count: int) -> np.ndarray:
         if residue_count <= 0:
-            return []
+            return np.zeros((0, 300), dtype=np.float32)
         if self.aa_vocab is None:
-            return np.zeros((residue_count, 300), dtype=np.float32).tolist()
-        tokens = self.tokenizer.convert_ids_to_tokens(input_ids)
+            return np.zeros((residue_count, self.aa_vec_dim), dtype=np.float32)
         aa_vec = []
-        for tok in tokens:
-            residue = _extract_residue_token(tok)
+        for token_id in input_ids:
+            if token_id not in self._token_id_to_residue:
+                token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+                self._token_id_to_residue[token_id] = _extract_residue_token(token)
+            residue = self._token_id_to_residue[token_id]
             if residue is None:
                 continue
             aa_vec.append(self.aa_vocab.get(residue, self.aa_vocab['X']))
@@ -1104,13 +1341,13 @@ class ProteinSeqTripletDataset(Dataset):
                 break
         if len(aa_vec) < residue_count:
             aa_vec.extend([self.aa_vocab['X']] * (residue_count - len(aa_vec)))
-        return np.asarray(aa_vec[:residue_count], dtype=np.float32).tolist()
+        return np.asarray(aa_vec[:residue_count], dtype=np.float32)
 
     def __getitem__(self, index: int) -> ProteinSeqTripletInputFeatures:
-        row = self.triplets[index]
-        anchor_seq = self._truncate(row["anchor_seq"])
-        positive_seq = self._truncate(row["positive_seq"])
-        negative_seq = self._truncate(row["negative_seq"])
+        row = self._read_row_at_offset(self.row_offsets[index])
+        anchor_seq = self._truncate(str(row["anchor_seq"]))
+        positive_seq = self._truncate(str(row["positive_seq"]))
+        negative_seq = self._truncate(str(row["negative_seq"]))
         anchor_input_ids = self.tokenizer.encode(anchor_seq, add_special_tokens=True)
         positive_input_ids = self.tokenizer.encode(positive_seq, add_special_tokens=True)
         negative_input_ids = self.tokenizer.encode(negative_seq, add_special_tokens=True)

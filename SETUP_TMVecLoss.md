@@ -3,7 +3,7 @@
 ## (0) Prerequisites
 
 - Python 3.9+
-- NVIDIA L4 GPU
+- 32GB RAM + NVIDIA L4 GPU
 
 ---
 
@@ -61,6 +61,18 @@ tar -xvf data/pretrain_data/swissprot_pdb_v6.tar -C data/pretrain_data/alphafold
 
 ## (4) Triplet construction test
 
+Run the following to construct `aa_vocab.pkl` in `/data/pretrain_data`:
+
+```bash
+python scripts_refactor/prepare_memory_assets.py \
+  --aa_vec_model_path data/pretrain_data/model_300dim.pkl \
+  --aa_vec_vocab_out data/pretrain_data/aa_vocab.pkl
+```
+
+---
+
+## (5) Triplet construction test
+
 Run the following to construct `tmvec_triplets_small.tsv` in `/data/pretrain_data`:
 
 ```bash
@@ -77,20 +89,21 @@ python scripts_refactor/generate_tmvec_pairs_tsv.py \
   --use_faiss \
   --seed 2021 \
   --max_proteins 10000 \
-  --log_every_anchors 1000 \
   --resume
 ```
 
 ---
 
-## (5) Coordinate extraction test
+## (6) Coordinate extraction & vocab export test
 
-Run the following to construct `coordinates_small.pkl` in `/data/pretrain_data`:
+Run the following to construct coordinate shards in `/data/pretrain_data/coordinates_small`:
 
 ```bash
 python scripts_refactor/extract_ca_coords.py \
   --input-dir data/pretrain_data/alphafold \
-  --output data/pretrain_data/coordinates_small.pkl \
+  --output data/pretrain_data/coordinates_small \
+  --output-format sharded \
+  --coordinate-format npy \
   --key-mode tsv_id \
   --fasta data/pretrain_data/swissprot_seq.fasta \
   --triplets-tsv data/pretrain_data/tmvec_triplets_small.tsv \
@@ -99,40 +112,41 @@ python scripts_refactor/extract_ca_coords.py \
 
 ---
 
-## (6) Pre-training test
+## (7) Pre-training test
 
 ```bash
 python run_pretrain_refactor.py \
   --model_protein_seq_data True \
   --use_tmvec_loss True \
   --output_dir outputs/glprotein_small \
-  --pretrain_data_dir data/pretrain_data \
-  --tmvec_triplets_tsv tmvec_triplets_small.tsv \
-  --coordinates_path coordinates_small.pkl \
-  --aa_vec_model_path model_300dim.pkl \
+  --tmvec_triplets_tsv data/pretrain_data/tmvec_triplets_small.tsv \
+  --coordinates_dir data/pretrain_data/coordinates_small \
+  --aa_vec_vocab_path data/pretrain_data/aa_vocab.pkl \
+  --filter_triplets_to_coordinate_coverage True \
+  --coordinate_cache_size 32 \
   --weight_decay 0.01 \
   --lr_scheduler_type linear \
   --lm_learning_rate 1e-5 \
   --lm_warmup_ratio 0.167 \
   --fp16 \
   --seed 2021 \
-  --per_device_train_batch_size 2 \
+  --gradient_checkpointing True \
+  --gradient_accumulation_steps 2 \
   --logging_steps 1 \
   --save_steps 4 \
   --max_steps 8 \
-  --gradient_accumulation_steps 2 \
-  --gradient_checkpointing True \
+  --per_device_train_batch_size 1 \
   --triplet_microbatch_size 1 \
-  --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
   --save_total_limit 2 \
-  --filter_triplets_to_coordinate_coverage True \
   --auto_resume_from_latest True
 ```
 
 ---
 
-## (7) Full triplet construction
+## (8) Full triplet construction
+
+Run the following to construct `tmvec_triplets_full.tsv` in `/data/pretrain_data`:
 
 ```bash
 python scripts_refactor/generate_tmvec_pairs_tsv.py \
@@ -148,7 +162,6 @@ python scripts_refactor/generate_tmvec_pairs_tsv.py \
   --use_faiss \
   --seed 2021 \
   --max_proteins 300000 \ # Edit this based on your dataset size
-  --log_every_anchors 100 \
   --resume
 ```
 
@@ -156,12 +169,16 @@ Checkpoints are saved during training. If interrupted, make sure `--resume` is i
 
 ---
 
-## (8) Full coordinate extraction
+## (9) Full coordinate extraction
+
+Run the following to construct coordinate shards in `/data/pretrain_data/coordinates_full`:
 
 ```bash
 python scripts_refactor/extract_ca_coords.py \
   --input-dir data/pretrain_data/alphafold \
-  --output data/pretrain_data/coordinates_full.pkl \
+  --output data/pretrain_data/coordinates_full \
+  --output-format sharded \
+  --coordinate-format npy \
   --key-mode tsv_id \
   --fasta data/pretrain_data/swissprot_seq.fasta \
   --triplets-tsv data/pretrain_data/tmvec_triplets_full.tsv \
@@ -172,31 +189,34 @@ Checkpoints are saved during training. If interrupted, make sure `--resume` is i
 
 ---
 
-## (9) Full pre-training
+## (10) Full pre-training
 
 ```bash
 python run_pretrain_refactor.py \
   --model_protein_seq_data True \
   --use_tmvec_loss True \
   --output_dir outputs/glprotein_full \
-  --pretrain_data_dir data/pretrain_data \
-  --tmvec_triplets_tsv tmvec_triplets_full.tsv \
+  --tmvec_triplets_tsv data/pretrain_data/tmvec_triplets_full.tsv \
+  --coordinates_dir data/pretrain_data/coordinates_full \
+  --aa_vec_vocab_path data/pretrain_data/aa_vocab.pkl \
+  --filter_triplets_to_coordinate_coverage True \
+  --coordinate_cache_size 32 \
   --weight_decay 0.01 \
   --lr_scheduler_type linear \
   --lm_learning_rate 1e-5 \
   --lm_warmup_ratio 0.167 \
   --fp16 \
   --seed 2021 \
-  --per_device_train_batch_size 2 \
-  --logging_steps 50 \
+  --gradient_checkpointing True \
+  --gradient_accumulation_steps 16 \
+  --logging_steps 10 \
   --save_steps 1000 \
   --max_steps 300000 \
-  --gradient_accumulation_steps 2 \
-  --gradient_checkpointing True \
+  --per_device_train_batch_size 1 \
   --triplet_microbatch_size 1 \
-  --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
   --save_total_limit 10 \
-  --filter_triplets_to_coordinate_coverage True \
   --auto_resume_from_latest True
 ```
+
+Checkpoints are saved during training. If interrupted, make sure `--auto_resume_from_latest` is included in the command and re-run.
