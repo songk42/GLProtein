@@ -131,13 +131,13 @@ python run_pretrain_refactor.py \
   --lm_warmup_ratio 0.167 \
   --fp16 \
   --seed 2021 \
-  --gradient_checkpointing True \
-  --gradient_accumulation_steps 2 \
+  --gradient_accumulation_steps 1 \
   --logging_steps 1 \
   --save_steps 4 \
   --max_steps 8 \
   --per_device_train_batch_size 1 \
   --triplet_microbatch_size 1 \
+  --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
   --save_total_limit 2 \
   --auto_resume_from_latest True
@@ -209,13 +209,13 @@ python run_pretrain_refactor.py \
   --lm_warmup_ratio 0.167 \
   --fp16 \
   --seed 2021 \
-  --gradient_checkpointing True \
-  --gradient_accumulation_steps 16 \
+  --gradient_accumulation_steps 1 \
   --logging_steps 10 \
   --save_steps 1000 \
   --max_steps 300000 \
   --per_device_train_batch_size 1 \
   --triplet_microbatch_size 1 \
+  --max_tokens_per_batch 2048 \
   --max_protein_seq_length 1024 \
   --save_total_limit 10 \
   --auto_resume_from_latest True

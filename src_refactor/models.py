@@ -707,6 +707,11 @@ class KnowledgeDecoder(BertPreTrainedModel):
     """
     Implementation of the full GLProtein decoder
     """
+    # Newer Transformers expects this attribute to exist during
+    # from_pretrained() finalization. This custom decoder does not rely on
+    # HF-managed tied-weight bookkeeping, so we provide an empty mapping.
+    all_tied_weights_keys = {}
+
 
     def __init__(self,decoder_config=None):
         super().__init__(decoder_config)
