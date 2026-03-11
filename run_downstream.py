@@ -188,15 +188,14 @@ def main():
     train_dataset = processor.get_train_examples(data_dir=data_args.data_dir)
     train_dataset = Subset(
         train_dataset,
-        sorted(range(len(train_dataset)), key=lambda i: len(train_dataset[i][0]))[:20]
+        sorted(range(len(train_dataset)), key=lambda i: len(train_dataset[i][0]))[:len(train_dataset)//2] 
     )
 
     eval_dataset = processor.get_dev_examples(data_dir=data_args.data_dir)
     eval_dataset = Subset(
         eval_dataset,
-        sorted(range(len(eval_dataset)), key=lambda i: len(eval_dataset[i][0]))[:10]
+        sorted(range(len(eval_dataset)), key=lambda i: len(eval_dataset[i][0]))[:len(eval_dataset)//2]
     )
-
     if data_args.task_name == 'remote_homology':
         test_fold_dataset = (
             processor.get_test_examples(data_dir=data_args.data_dir, data_cat='test_fold_holdout')

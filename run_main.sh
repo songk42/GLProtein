@@ -29,7 +29,7 @@ fi
 echo $LR
 
 DATA_DIR=../data/downstream_datasets
-OUTPUT_DIR=../trainer_output/$TASK_NAME/$SEED-$OI
+OUTPUT_DIR=../outputs/$TASK_NAME/$SEED-$OI
 
 python3 ../run_downstream.py \
   --task_name $TASK_NAME \
