@@ -861,74 +861,68 @@ class PairwiseContactPredictionHead(nn.Module):
             loss_fct = nn.CrossEntropyLoss(ignore_index=self._ignore_index)
             contact_loss = loss_fct(
                 prediction.view(-1, 2), targets.view(-1))
-            metrics = {'precision_at_l5':
-                       self.compute_precision_at_l5(sequence_lengths, prediction, targets),
-                       'precision_at_l2':
-                       self.compute_precision_at_l2(sequence_lengths, prediction, targets),
-                       'precision_at_l':
-                       self.compute_precision_at_l(sequence_lengths, prediction, targets)}
+            metrics = {
+                # Short range: 6 <= sep < 12
+                'precision_at_l5_short':  self.compute_precision_at_k(sequence_lengths, prediction, targets, 5,  6, 12),
+                'precision_at_l2_short':  self.compute_precision_at_k(sequence_lengths, prediction, targets, 2,  6, 12),
+                'precision_at_l_short':   self.compute_precision_at_k(sequence_lengths, prediction, targets, 1,  6, 12),
+                # Medium range: 12 <= sep < 24
+                'precision_at_l5_medium': self.compute_precision_at_k(sequence_lengths, prediction, targets, 5,  12, 24),
+                'precision_at_l2_medium': self.compute_precision_at_k(sequence_lengths, prediction, targets, 2,  12, 24),
+                'precision_at_l_medium':  self.compute_precision_at_k(sequence_lengths, prediction, targets, 1,  12, 24),
+                # Long range: 24 <= sep
+                'precision_at_l5_long':   self.compute_precision_at_k(sequence_lengths, prediction, targets, 5,  24, None),
+                'precision_at_l2_long':   self.compute_precision_at_k(sequence_lengths, prediction, targets, 2,  24, None),
+                'precision_at_l_long':    self.compute_precision_at_k(sequence_lengths, prediction, targets, 1,  24, None),
+                # Keep overall metrics for backward compatibility
+                'precision_at_l5': self.compute_precision_at_k(sequence_lengths, prediction, targets, 5,  6, None),
+                'precision_at_l2': self.compute_precision_at_k(sequence_lengths, prediction, targets, 2,  6, None),
+                'precision_at_l':  self.compute_precision_at_k(sequence_lengths, prediction, targets, 1,  6, None),
+            }
             loss_and_metrics = (contact_loss, metrics)
             outputs = (loss_and_metrics,) + outputs
 
         return outputs
 
-    def compute_precision_at_l5(self, sequence_lengths, prediction, labels):
+    def compute_precision_at_k(self, sequence_lengths, prediction, labels,
+                                 k_divisor: int,
+                                 sep_min: int = 6,
+                                 sep_max=None):
+        """
+        Generic precision@L/k for a given sequence separation range [sep_min, sep_max).
+        k_divisor=1 -> P@L, k_divisor=2 -> P@L/2, k_divisor=5 -> P@L/5
+        sep_max=None means no upper bound (i.e. >= sep_min)
+        """
         with torch.no_grad():
             valid_mask = labels != self._ignore_index
             seqpos = torch.arange(valid_mask.size(1), device=sequence_lengths.device)
-            x_ind, y_ind = torch.meshgrid(seqpos, seqpos)
+            x_ind, y_ind = torch.meshgrid(seqpos, seqpos, indexing='ij')
+            sep = (y_ind - x_ind).abs()
 
-            valid_mask &= ((y_ind - x_ind) >= 6).unsqueeze(0)
+            range_mask = sep >= sep_min
+            if sep_max is not None:
+                range_mask &= sep < sep_max
 
-            probs = F.softmax(prediction, 3)[:, :, :, 1]
-            valid_mask = valid_mask.type_as(probs)
-            correct = 0
-            total = 0
-            for length, prob, label, mask in zip(sequence_lengths, probs, labels, valid_mask):
-                masked_prob = (prob * mask).view(-1)
-                most_likely = masked_prob.topk(length // 5, sorted=False)
-                selected = label.view(-1).gather(0, most_likely.indices)
-                correct += selected.sum().float()
-                total += selected.numel()
-            # return probs, correct / total
-            return correct / total
-
-    def compute_precision_at_l2(self, sequence_lengths, prediction, labels):
-        with torch.no_grad():
-            valid_mask = labels != self._ignore_index
-            seqpos = torch.arange(valid_mask.size(1), device=sequence_lengths.device)
-            x_ind, y_ind = torch.meshgrid(seqpos, seqpos)
-
-            valid_mask &= ((y_ind - x_ind) >= 6).unsqueeze(0)
+            valid_mask &= range_mask.unsqueeze(0)
 
             probs = F.softmax(prediction, 3)[:, :, :, 1]
             valid_mask = valid_mask.type_as(probs)
+
             correct = 0
             total = 0
             for length, prob, label, mask in zip(sequence_lengths, probs, labels, valid_mask):
+                k = max(1, length.item() // k_divisor)
                 masked_prob = (prob * mask).view(-1)
-                most_likely = masked_prob.topk(length // 2, sorted=False)
+                # make sure k doesn't exceed available valid pairs
+                num_valid = int(mask.sum().item())
+                if num_valid == 0:
+                    continue
+                k = min(k, num_valid)
+                most_likely = masked_prob.topk(k, sorted=False)
                 selected = label.view(-1).gather(0, most_likely.indices)
                 correct += selected.sum().float()
                 total += selected.numel()
-            return correct / total
 
-    def compute_precision_at_l(self, sequence_lengths, prediction, labels):
-        with torch.no_grad():
-            valid_mask = labels != self._ignore_index
-            seqpos = torch.arange(valid_mask.size(1), device=sequence_lengths.device)
-            x_ind, y_ind = torch.meshgrid(seqpos, seqpos)
-
-            valid_mask &= ((y_ind - x_ind) >= 6).unsqueeze(0)
-            
-            probs = F.softmax(prediction, 3)[:, :, :, 1]
-            valid_mask = valid_mask.type_as(probs)
-            correct = 0
-            total = 0
-            for length, prob, label, mask in zip(sequence_lengths, probs, labels, valid_mask):
-                masked_prob = (prob * mask).view(-1)
-                most_likely = masked_prob.topk(length, sorted=False)
-                selected = label.view(-1).gather(0, most_likely.indices)
-                correct += selected.sum().float()
-                total += selected.numel()
+            if total == 0:
+                return torch.tensor(0.0, device=sequence_lengths.device)
             return correct / total
