@@ -174,8 +174,11 @@ def main():
 
     # Load dataset
     tokenizer_path = model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path
-    if os.path.exists(tokenizer_path) or tokenizer_path.startswith('.') or tokenizer_path.startswith('/'):
+    if tokenizer_path.startswith('.') or tokenizer_path.startswith('/'):
         tokenizer_path = os.path.abspath(tokenizer_path)
+    if not os.path.exists(tokenizer_path):
+        logger.warning(f"Tokenizer path '{tokenizer_path}' not found, falling back to model path.")
+        tokenizer_path = os.path.abspath(model_args.model_name_or_path)
 
     tokenizer = BertTokenizerFast.from_pretrained(
         tokenizer_path,

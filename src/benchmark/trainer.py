@@ -2,6 +2,7 @@ import collections
 import warnings
 from typing import Tuple, Optional, Union, Dict, Any, List
 
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
@@ -108,7 +109,7 @@ class OntoProteinTrainer(Trainer):
         for c in cutoff_names:
             contact_metrics[c] = []
 
-        for step, inputs in enumerate(dataloader):
+        for step, inputs in tqdm(enumerate(dataloader), total=num_examples, desc=description):
             loss, logits, labels, prediction_score, probs, invalid_mask = self.prediction_step(model, inputs, prediction_loss_only)
 
             for r in range_names:
@@ -195,7 +196,8 @@ class OntoProteinTrainer(Trainer):
 
         observed_num_examples = 0
 
-        for step, inputs in enumerate(dataloader):
+        total_steps = len(dataloader) if isinstance(dataloader.dataset, collections.abc.Sized) else None
+        for step, inputs in tqdm(enumerate(dataloader), total=total_steps, desc=description):
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:
                 observed_num_examples += observed_batch_size
