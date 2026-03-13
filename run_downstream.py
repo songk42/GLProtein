@@ -1,4 +1,5 @@
 import os
+import shutil
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from typing import Optional
 
@@ -99,8 +100,13 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "evaluate during training."}
     )
     save_total_limit: int = field(
-        default=3,
+        default=1,
         metadata={"help": "If a value is passed, will limit the total amount of checkpoints."}
+    )
+
+    delete_checkpoints_after_predict: bool = field(
+        default=False,
+        metadata={"help": "Delete intermediate checkpoint directories after prediction to save disk space."}
     )
 
     past_index: int = field(
@@ -302,6 +308,16 @@ def main():
     else:
         predictions_family, input_ids_family, metrics_family = trainer.predict(test_dataset)
         print("metrics", metrics_family)
+
+    # Delete intermediate checkpoints to save disk space
+    if training_args.delete_checkpoints_after_predict:
+        for entry in os.scandir(training_args.output_dir):
+            if entry.is_dir() and entry.name.startswith("checkpoint-"):
+                shutil.rmtree(entry.path)
+                logger.info(f"Deleted checkpoint: {entry.path}")
+
+    # Write sentinel so sweep knows this run completed successfully
+    open(os.path.join(training_args.output_dir, "prediction_done"), "w").close()
 
 
 if __name__ == '__main__':

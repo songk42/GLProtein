@@ -159,12 +159,33 @@ for TASK in "${TASK_LIST[@]}"; do
                     --learning_rate  "$LR"
                     --seed           "$SEED"
                     --frozen_bert    "${TASK_FROZEN_BERT[$TASK]}"
+                    --delete_checkpoints_after_predict True
                 )
 
                 OUTPUT_DIR="../outputs/${TASK}/${SEED}-${OUTPUT_FILE}"
                 echo -e "${TASK}\t${LR}\t${BS}\t${EP}\t${OUTPUT_DIR}" >> "$SWEEP_LOG"
 
                 echo "[${COUNT}/${TOTAL}] ${TASK} | lr=${LR} bs=${BS} epochs=${EP}"
+
+                # Skip if already completed
+                if [[ -f "${OUTPUT_DIR}/prediction_done" ]]; then
+                    echo "  Skipping — already complete."
+                    continue
+                fi
+
+                # Detect state of this run directory
+                MODEL_FILE=$(ls "${OUTPUT_DIR}/model.safetensors" "${OUTPUT_DIR}/pytorch_model.bin" 2>/dev/null | head -1 || true)
+                LATEST_CKPT=$(ls -d "${OUTPUT_DIR}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1 || true)
+
+                if [[ -n "$MODEL_FILE" ]]; then
+                    # Training finished but prediction didn't complete — skip training
+                    echo "  Model found, re-running prediction only."
+                    CMD+=(--do_train False)
+                elif [[ -n "$LATEST_CKPT" ]]; then
+                    # Training was interrupted — resume from latest checkpoint
+                    echo "  Resuming training from checkpoint: $(basename "$LATEST_CKPT")"
+                    CMD+=(--resume_from_checkpoint "$LATEST_CKPT")
+                fi
 
                 if [[ "$DRY_RUN" = true ]]; then
                     echo "  CMD: ${CMD[*]} > ${LOG_FILE} 2>&1"
