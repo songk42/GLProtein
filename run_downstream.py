@@ -149,23 +149,27 @@ class BTDataTrainingArguments:
 
 
 class EpochMetricsCallback(TrainerCallback):
-    def __init__(self, task_name: str, n: int):
+    """Evaluates on test sets every N epochs and prints a concise metrics summary."""
+    def __init__(self, task_name: str, n: int, test_datasets: dict):
+        # test_datasets: OrderedDict of {split_name: dataset}
         self.task_name = task_name
         self.n = n
+        self.test_datasets = test_datasets
+        self.trainer = None  # set after trainer is created
 
     def on_epoch_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
         epoch = int(state.epoch)
-        if epoch % self.n != 0:
+        if epoch % self.n != 0 or self.trainer is None:
             return
-        # Collect the most recent eval and train metrics from log history
-        metrics = {}
-        for entry in state.log_history:
-            metrics.update(entry)
-        # Filter to relevant keys only
-        show = {k: f"{v:.4f}" if isinstance(v, float) else v
-                for k, v in metrics.items()
-                if any(k.startswith(p) for p in ("eval_", "train_loss", "loss"))}
-        print(f"[{self.task_name} epoch {epoch}/{int(args.num_train_epochs)}] {show}", flush=True)
+        parts = []
+        for split_name, dataset in self.test_datasets.items():
+            metrics = self.trainer.evaluate(dataset, metric_key_prefix=f"test_{split_name}")
+            # Drop internal HF keys, format floats
+            summary = {k: f"{v:.4f}" if isinstance(v, float) else v
+                       for k, v in metrics.items()
+                       if not k.startswith("test__")}
+            parts.append(f"{split_name}: {summary}")
+        print(f"\n[{self.task_name} | epoch {epoch}/{int(args.num_train_epochs)}] " + " | ".join(parts), flush=True)
 
 
 def main():
@@ -283,9 +287,18 @@ def main():
         pass
 
 
+    if data_args.task_name == 'remote_homology':
+        _test_datasets = {'fold': test_fold_dataset, 'family': test_family_dataset, 'superfamily': test_superfamily_dataset}
+    elif data_args.task_name in ('ss3', 'ss8'):
+        _test_datasets = {'cb513': cb513_dataset, 'ts115': ts115_dataset, 'casp12': casp12_dataset}
+    else:
+        _test_datasets = {'test': test_dataset}
+
     callbacks = []
+    epoch_cb = None
     if training_args.report_every_n_epochs > 0:
-        callbacks.append(EpochMetricsCallback(data_args.task_name, training_args.report_every_n_epochs))
+        epoch_cb = EpochMetricsCallback(data_args.task_name, training_args.report_every_n_epochs, _test_datasets)
+        callbacks.append(epoch_cb)
 
     if data_args.task_name == 'contact':
         # training_args.do_predict=False
@@ -311,6 +324,9 @@ def main():
             optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None),
             callbacks=callbacks,
         )
+
+    if epoch_cb is not None:
+        epoch_cb.trainer = trainer
 
     # Training
     if training_args.do_train:
