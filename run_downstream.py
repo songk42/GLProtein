@@ -5,6 +5,7 @@ from typing import Optional
 
 from dataclasses import dataclass, field
 from transformers import HfArgumentParser, TrainingArguments, BertTokenizerFast, set_seed, Trainer
+from transformers import TrainerCallback, TrainerState, TrainerControl
 import logging
 
 from src.benchmark.models import model_mapping, load_adam_optimizer_and_scheduler
@@ -109,6 +110,11 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "Delete intermediate checkpoint directories after prediction to save disk space."}
     )
 
+    report_every_n_epochs: int = field(
+        default=1,
+        metadata={"help": "Print a metric summary to stdout every N epochs during training. Set 0 to disable."}
+    )
+
     past_index: int = field(
         default=-1,
         metadata={"help": "Past index for models that use cached past states. Keep -1 to disable."}
@@ -140,6 +146,26 @@ class BTDataTrainingArguments:
 
     def __post_init__(self):
         self.task_name = self.task_name.lower()
+
+
+class EpochMetricsCallback(TrainerCallback):
+    def __init__(self, task_name: str, n: int):
+        self.task_name = task_name
+        self.n = n
+
+    def on_epoch_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        epoch = int(state.epoch)
+        if epoch % self.n != 0:
+            return
+        # Collect the most recent eval and train metrics from log history
+        metrics = {}
+        for entry in state.log_history:
+            metrics.update(entry)
+        # Filter to relevant keys only
+        show = {k: f"{v:.4f}" if isinstance(v, float) else v
+                for k, v in metrics.items()
+                if any(k.startswith(p) for p in ("eval_", "train_loss", "loss"))}
+        print(f"[{self.task_name} epoch {epoch}/{int(args.num_train_epochs)}] {show}", flush=True)
 
 
 def main():
@@ -257,6 +283,10 @@ def main():
         pass
 
 
+    callbacks = []
+    if training_args.report_every_n_epochs > 0:
+        callbacks.append(EpochMetricsCallback(data_args.task_name, training_args.report_every_n_epochs))
+
     if data_args.task_name == 'contact':
         # training_args.do_predict=False
         trainer = OntoProteinTrainer(
@@ -267,7 +297,8 @@ def main():
             eval_dataset=eval_dataset,
             compute_metrics=build_compute_metrics_fn(data_args.task_name, output_type=output_mode),
             data_collator=train_dataset.dataset.collate_fn,
-            optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None)
+            optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None),
+            callbacks=callbacks,
         )
     else:
         trainer = Trainer(
@@ -277,7 +308,8 @@ def main():
             eval_dataset=eval_dataset,
             compute_metrics=build_compute_metrics_fn(data_args.task_name, output_type=output_mode),
             data_collator=train_dataset.dataset.collate_fn,
-            optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None)
+            optimizers=load_adam_optimizer_and_scheduler(model, training_args, train_dataset) if model_args.optimizer=='Adam' else (None, None),
+            callbacks=callbacks,
         )
 
     # Training

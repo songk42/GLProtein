@@ -25,23 +25,25 @@ TOKENIZER="../outputs/glprotein_full/checkpoint-100000/protein_tokenizer"
 TASKS="contact,ss3,ss8"
 LRS="1e-5,1e-4,1e-3"
 BATCH_SIZES="2,4"
-EPOCHS="5,10,15"
+EPOCHS="15"
 SEED=3
 PARALLEL=false
 DRY_RUN=false
+REPORT_N_EPOCHS=5
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)       MODEL="$2";       shift 2 ;;
-        --tokenizer)   TOKENIZER="$2";   shift 2 ;;
-        --tasks)       TASKS="$2";       shift 2 ;;
-        --lrs)         LRS="$2";         shift 2 ;;
-        --batch_sizes) BATCH_SIZES="$2"; shift 2 ;;
-        --epochs)      EPOCHS="$2";      shift 2 ;;
-        --seed)        SEED="$2";        shift 2 ;;
-        --parallel)    PARALLEL=true;    shift 1 ;;
-        --dry_run)     DRY_RUN=true;     shift 1 ;;
+        --model)                 MODEL="$2";           shift 2 ;;
+        --tokenizer)             TOKENIZER="$2";       shift 2 ;;
+        --tasks)                 TASKS="$2";           shift 2 ;;
+        --lrs)                   LRS="$2";             shift 2 ;;
+        --batch_sizes)           BATCH_SIZES="$2";     shift 2 ;;
+        --epochs)                EPOCHS="$2";          shift 2 ;;
+        --seed)                  SEED="$2";            shift 2 ;;
+        --report_every_n_epochs) REPORT_N_EPOCHS="$2"; shift 2 ;;
+        --parallel)              PARALLEL=true;        shift 1 ;;
+        --dry_run)               DRY_RUN=true;         shift 1 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -101,7 +103,6 @@ declare -A TASK_WARMUP=(
 IFS=',' read -ra TASK_LIST    <<< "$TASKS"
 IFS=',' read -ra LR_LIST      <<< "$LRS"
 IFS=',' read -ra BS_LIST      <<< "$BATCH_SIZES"
-IFS=',' read -ra EPOCH_LIST   <<< "$EPOCHS"
 
 SWEEP_LOG="../outputs/sweep_results.tsv"
 mkdir -p "../outputs"
@@ -110,7 +111,7 @@ if [[ ! -f "$SWEEP_LOG" ]]; then
 fi
 
 PIDS=()
-TOTAL=$(( ${#TASK_LIST[@]} * ${#LR_LIST[@]} * ${#BS_LIST[@]} * ${#EPOCH_LIST[@]} ))
+TOTAL=$(( ${#TASK_LIST[@]} * ${#LR_LIST[@]} * ${#BS_LIST[@]} ))
 COUNT=0
 
 echo "========================================"
@@ -118,7 +119,7 @@ echo " Downstream Hyperparameter Sweep"
 echo " Tasks:        ${TASK_LIST[*]}"
 echo " LRs:          ${LR_LIST[*]}"
 echo " Batch sizes:  ${BS_LIST[*]}"
-echo " Epochs:       ${EPOCH_LIST[*]}"
+echo " Epochs:       ${EPOCHS}"
 echo " Total runs:   $TOTAL"
 echo " Mode:         $([ "$PARALLEL" = true ] && echo parallel || echo sequential)"
 echo " Dry run:      $DRY_RUN"
@@ -136,71 +137,70 @@ for TASK in "${TASK_LIST[@]}"; do
 
     for LR in "${LR_LIST[@]}"; do
         for BS in "${BS_LIST[@]}"; do
-            for EP in "${EPOCH_LIST[@]}"; do
-                COUNT=$(( COUNT + 1 ))
-                RUN_ID="lr${LR}_bs${BS}_ep${EP}"
-                OUTPUT_FILE="${TASK}-sweep-${RUN_ID}"
-                LOG_FILE="${LOG_DIR}/${RUN_ID}.out"
+            COUNT=$(( COUNT + 1 ))
+            RUN_ID="lr${LR}_bs${BS}"
+            OUTPUT_FILE="${TASK}-sweep-${RUN_ID}"
+            LOG_FILE="${LOG_DIR}/${RUN_ID}.out"
 
-                CMD=(
-                    bash ../run_main.sh
-                    --model          "$MODEL"
-                    --tokenizer_name "$TOKENIZER"
-                    --output_file    "$OUTPUT_FILE"
-                    --task_name      "$TASK"
-                    --do_train       True
-                    --epoch          "$EP"
-                    --optimizer      "${TASK_OPTIMIZER[$TASK]}"
-                    --per_device_batch_size        "$BS"
-                    --gradient_accumulation_steps  "${TASK_GRAD_ACCUM[$TASK]}"
-                    --eval_step      "${TASK_EVAL_STEP[$TASK]}"
-                    --eval_batchsize "${TASK_EVAL_BS[$TASK]}"
-                    --warmup_ratio   "${TASK_WARMUP[$TASK]}"
-                    --learning_rate  "$LR"
-                    --seed           "$SEED"
-                    --frozen_bert    "${TASK_FROZEN_BERT[$TASK]}"
-                    --delete_checkpoints_after_predict True
-                )
+            CMD=(
+                bash ../run_main.sh
+                --model          "$MODEL"
+                --tokenizer_name "$TOKENIZER"
+                --output_file    "$OUTPUT_FILE"
+                --task_name      "$TASK"
+                --do_train       True
+                --epoch          "$EPOCHS"
+                --optimizer      "${TASK_OPTIMIZER[$TASK]}"
+                --per_device_batch_size        "$BS"
+                --gradient_accumulation_steps  "${TASK_GRAD_ACCUM[$TASK]}"
+                --eval_step      "${TASK_EVAL_STEP[$TASK]}"
+                --eval_batchsize "${TASK_EVAL_BS[$TASK]}"
+                --warmup_ratio   "${TASK_WARMUP[$TASK]}"
+                --learning_rate  "$LR"
+                --seed           "$SEED"
+                --frozen_bert    "${TASK_FROZEN_BERT[$TASK]}"
+                --delete_checkpoints_after_predict True
+                --report_every_n_epochs "$REPORT_N_EPOCHS"
+            )
 
-                OUTPUT_DIR="../outputs/${TASK}/${SEED}-${OUTPUT_FILE}"
-                echo -e "${TASK}\t${LR}\t${BS}\t${EP}\t${OUTPUT_DIR}" >> "$SWEEP_LOG"
+            OUTPUT_DIR="../outputs/${TASK}/${SEED}-${OUTPUT_FILE}"
+            echo -e "${TASK}\t${LR}\t${BS}\t${EPOCHS}\t${OUTPUT_DIR}" >> "$SWEEP_LOG"
 
-                echo "[${COUNT}/${TOTAL}] ${TASK} | lr=${LR} bs=${BS} epochs=${EP}"
+            echo "[${COUNT}/${TOTAL}] ${TASK} | lr=${LR} bs=${BS} epochs=${EPOCHS}"
 
-                # Skip if already completed
-                if [[ -f "${OUTPUT_DIR}/prediction_done" ]]; then
-                    echo "  Skipping — already complete."
-                    continue
-                fi
+            # Skip if already completed
+            if [[ -f "${OUTPUT_DIR}/prediction_done" ]]; then
+                echo "  Skipping — already complete."
+                continue
+            fi
 
-                # Detect state of this run directory
-                MODEL_FILE=$(ls "${OUTPUT_DIR}/model.safetensors" "${OUTPUT_DIR}/pytorch_model.bin" 2>/dev/null | head -1 || true)
-                LATEST_CKPT=$(ls -d "${OUTPUT_DIR}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1 || true)
+            # Detect state of this run directory
+            MODEL_FILE=$(ls "${OUTPUT_DIR}/model.safetensors" "${OUTPUT_DIR}/pytorch_model.bin" 2>/dev/null | head -1 || true)
+            LATEST_CKPT=$(ls -d "${OUTPUT_DIR}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1 || true)
 
-                if [[ -n "$MODEL_FILE" ]]; then
-                    # Training finished but prediction didn't complete — skip training
-                    echo "  Model found, re-running prediction only."
-                    CMD+=(--do_train False)
-                elif [[ -n "$LATEST_CKPT" ]]; then
-                    # Training was interrupted — resume from latest checkpoint
-                    echo "  Resuming training from checkpoint: $(basename "$LATEST_CKPT")"
-                    CMD+=(--resume_from_checkpoint "$LATEST_CKPT")
-                fi
+            if [[ -n "$MODEL_FILE" ]]; then
+                # Training finished but prediction didn't complete — skip training
+                echo "  Model found, re-running prediction only."
+                CMD+=(--do_train False)
+            elif [[ -n "$LATEST_CKPT" ]]; then
+                # Training was interrupted — resume from latest checkpoint
+                echo "  Resuming training from checkpoint: $(basename "$LATEST_CKPT")"
+                CMD+=(--resume_from_checkpoint "$LATEST_CKPT")
+            fi
 
-                if [[ "$DRY_RUN" = true ]]; then
-                    echo "  CMD: ${CMD[*]} > ${LOG_FILE} 2>&1"
-                    continue
-                fi
+            if [[ "$DRY_RUN" = true ]]; then
+                echo "  CMD: ${CMD[*]} > ${LOG_FILE} 2>&1"
+                continue
+            fi
 
-                if [[ "$PARALLEL" = true ]]; then
-                    "${CMD[@]}" > "$LOG_FILE" 2>&1 &
-                    PIDS+=($!)
-                    echo "  Launched PID $!"
-                else
-                    "${CMD[@]}" > "$LOG_FILE" 2>&1
-                    echo "  Done. Log: $LOG_FILE"
-                fi
-            done
+            if [[ "$PARALLEL" = true ]]; then
+                "${CMD[@]}" > "$LOG_FILE" 2>&1 &
+                PIDS+=($!)
+                echo "  Launched PID $!"
+            else
+                "${CMD[@]}" > "$LOG_FILE" 2>&1
+                echo "  Done. Log: $LOG_FILE"
+            fi
         done
     done
 done

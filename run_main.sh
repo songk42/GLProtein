@@ -20,6 +20,7 @@ while [[ $# -gt 0 ]]; do
         --tokenizer_name) TOKENIZER="$2"; shift 2 ;;
         --delete_checkpoints_after_predict) DELETE_CKPTS="$2"; shift 2 ;;
         --resume_from_checkpoint) RESUME_CKPT="$2"; shift 2 ;;
+        --report_every_n_epochs) REPORT_N_EPOCHS="$2"; shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -54,4 +55,5 @@ python3 ../run_downstream.py \
   --optimizer $OPTIMIZER \
   --frozen_bert $FROZEN_BERT \
   ${DELETE_CKPTS:+--delete_checkpoints_after_predict $DELETE_CKPTS} \
-  ${RESUME_CKPT:+--resume_from_checkpoint $RESUME_CKPT}
+  ${RESUME_CKPT:+--resume_from_checkpoint $RESUME_CKPT} \
+  ${REPORT_N_EPOCHS:+--report_every_n_epochs $REPORT_N_EPOCHS}
