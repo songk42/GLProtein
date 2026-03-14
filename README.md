@@ -93,7 +93,7 @@ cp replace_code/tape/modeling_utils.py $(python -c "import tape; print(tape.__fi
 | [ProtBERT](https://huggingface.co/Rostlab/prot_bert) | Protein sequence encoder (initialisation) | HuggingFace |
 | Mol2Vec | 300-dim amino acid substructure embeddings | `data/pretrain_data/model_300dim.pkl` |
 
-A fine-tuned GLProtein checkpoint is available at: [Google Drive](https://drive.google.com/file/d) *(update link when available)*.
+A pre-trained GLProtein checkpoint is available at: [Google Drive](https://drive.google.com/file/d/1Q5HSEPO_RXUDZjEDFYNyLQHmC322sF2L/view?usp=drive_link).
 
 ---
 
