@@ -21,7 +21,7 @@ mapped TSV ID appears in the training TSV's `anchor_id` column. This is useful w
 the FASTA covers more proteins than are actually used as anchors during training.
 
 Usage:
-    python scripts_refactor/extract_ca_coords.py \
+    python script/extract_ca_coords.py \
         --input-dir /path/to/structures \
         --output /path/to/coordinates.pkl \
         --key-mode tsv_id \
@@ -51,7 +51,7 @@ def _ensure_local_module_path() -> None:
     current_dir = Path(__file__).resolve().parent
     candidate_dirs = [
         current_dir,
-        current_dir.parent / 'src_refactor',
+        current_dir.parent / 'src',
     ]
     for candidate in candidate_dirs:
         if candidate.is_dir() and str(candidate) not in sys.path:

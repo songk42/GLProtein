@@ -7,12 +7,12 @@ from transformers import HfArgumentParser, set_seed
 from transformers import BertTokenizer, AutoTokenizer, logging
 # from transformers.trainer_pt_utils import get_parameter_names
 
-from src_refactor.models import GLProtein, GLProteinConfig, KnowledgeDecoder
-from src_refactor.trainer import GLProteinTrainer
-from src_refactor.sampling import negative_sampling_strategy
-from src_refactor.dataset import ProteinSeqDataset, ProteinSeqPairDataset, ProteinSeqTripletDataset, ProteinGoDataset
-from src_refactor.dataloader import DataCollatorForGoGo, DataCollatorForLanguageModeling, DataCollatorForProteinGo
-from src_refactor.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
+from src.models import GLProtein, GLProteinConfig, KnowledgeDecoder
+from src.trainer import GLProteinTrainer
+from src.sampling import negative_sampling_strategy
+from src.dataset import ProteinSeqDataset, ProteinSeqPairDataset, ProteinSeqTripletDataset, ProteinGoDataset
+from src.dataloader import DataCollatorForGoGo, DataCollatorForLanguageModeling, DataCollatorForProteinGo
+from src.training_args import KMAEModelArguments, DataArguments, KMAETrainingArguments
 
 logger = logging.get_logger(__name__)
 DEVICE = 'cpu'

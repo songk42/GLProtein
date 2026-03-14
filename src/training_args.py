@@ -1,7 +1,9 @@
 from collections import defaultdict
 from json import decoder
 import math
+import warnings
 from dataclasses import dataclass, field
+from typing import Optional
 from transformers import logging
 from transformers.training_args import TrainingArguments
 
@@ -11,11 +13,11 @@ from src.sampling import negative_sampling_strategy
 @dataclass
 class KMAEModelArguments:
     encoder_model_file_name: str = field(
-        default=None,
+        default="Rostlab/prot_bert",
         metadata={"help": "The directory of protein sequence pretrained model."}
     )
     text_model_file_name: str = field(
-        default=None,
+        default="neuml/pubmedbert-base-embeddings",
         metadata={"help": "The directory of text sequence pretrained model."}
     )
     encoder_model_config_name: str = field(
@@ -42,7 +44,7 @@ class KMAEModelArguments:
     )
 
     decoder_model_file_name: str = field(
-        default=None,
+        default="initial_decoder_config/config.json",
         metadata={"help":"The directory of the decoder model"}
     )
 
@@ -127,6 +129,78 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Weight of Protein Function Inference loss."}
     )
 
+    # Global structure / TM-Vec loss (optional)
+    use_tmvec_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to add the TM-Vec contrastive loss during pretraining."}
+    )
+    tmvec_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight for TM-Vec loss."}
+    )
+    tmvec_model_ckpt: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to TM-Vec checkpoint (.ckpt)."}
+    )
+    tmvec_model_config_json: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to TM-Vec model params JSON."}
+    )
+    tmvec_prot_t5_name: str = field(
+        default="Rostlab/prot_t5_xl_uniref50",
+        metadata={"help": "ProtT5 encoder name for TM-Vec."}
+    )
+    tmvec_device: Optional[str] = field(
+        default=None,
+        metadata={"help": "Device for TM-Vec ('cuda' or 'cpu')."}
+    )
+    tmvec_temperature: float = field(
+        default=0.07,
+        metadata={"help": "Temperature for the global structure contrastive loss on GLProtein embeddings."}
+    )
+    tmvec_distill_weight: float = field(
+        default=0.0,
+        metadata={"help": "Optional weight for TM-Vec similarity distillation. Set 0 to disable."}
+    )
+    triplet_margin: float = field(
+        default=0.2,
+        metadata={"help": "Margin for the paper-style global structure triplet loss."}
+    )
+    triplet_distance_type: str = field(
+        default="l2",
+        metadata={"help": "Distance type for triplet loss: l2 or cosine."}
+    )
+    tmvec_freeze: bool = field(
+        default=True,
+        metadata={"help": "Whether to freeze TM-Vec and ProtT5 encoders."}
+    )
+
+    tmvec_use_half: bool = field(
+        default=False,
+        metadata={"help": "Whether to use half precision for TM-Vec to save memory."}
+    )
+
+    triplet_microbatch_size: int = field(
+        default=0,
+        metadata={"help": "Optional microbatch size for sequential triplet encoding. 0 disables chunking."}
+    )
+    length_bucketed_batches: bool = field(
+        default=False,
+        metadata={"help": "Whether to bucket protein sequence batches by sequence length to reduce padding and VRAM spikes."}
+    )
+    length_bucket_size_multiplier: int = field(
+        default=20,
+        metadata={"help": "Pool size multiplier for length-bucketed batching. Larger values improve bucketing at the cost of more sorting."}
+    )
+
+    max_tokens_per_batch: int = field(
+        default=0,
+        metadata={"help": "Optional padded-token budget for protein sequence batches. 0 disables token-budget batching."}
+    )
+    loss_trace_max_history: int = field(
+        default=1000,
+        metadata={"help": "Maximum number of recent loss records kept in memory and checkpoint summaries. The full append-only JSONL trace is still written to output_dir."}
+    )
 
     # respectively set learning rate to training of protein language model and knowledge embedding
     lm_learning_rate: float = field(
@@ -143,7 +217,7 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Total number of training epochs of Protein MLM to perform."}
     )
     num_protein_go_epochs: int = field(
-        default=3,
+        default =3,
         metadata={"help": "Total number of training epochs of Protein-Go KE to perform."}
     )
     num_go_go_epochs: int = field(
@@ -184,12 +258,68 @@ class KMAETrainingArguments(TrainingArguments):
         metadata={"help": "Linear warmup over warmup_ratio fraction of total steps for LM."}
     )
 
+    do_train: bool = field(
+        default=True,
+        metadata={"help": "Whether or not to train the model."}
+    )
+
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a checkpoint directory to resume training from."}
+    )
+    model_checkpoint_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to a saved GLProtein checkpoint directory to load model weights from without optimizer/scheduler resume."}
+    )
+    load_full_glprotein_checkpoint: bool = field(
+        default=True,
+        metadata={"help": "Whether to prefer loading a self-contained GLProtein checkpoint directory when available."}
+    )
+    auto_resume_from_latest: bool = field(
+        default=False,
+        metadata={"help": "Automatically resume from the latest checkpoint under output_dir if available."}
+    )
+    save_text_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to save the text tokenizer alongside checkpoints when available."}
+    )
+
+    adafactor: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use adafactor optimizer."}
+    )
+
     def __post_init__(self):
         super().__post_init__()
 
         self.per_device_train_protein_seq_batch_size = self.per_device_train_batch_size
         self.per_device_train_go_go_batch_size = self.per_device_train_batch_size
         self.per_device_train_protein_go_batch_size = self.per_device_train_batch_size
+
+        if self.use_tmvec_loss:
+            deprecated_tmvec_runtime_args = []
+            for name in ["tmvec_model_ckpt", "tmvec_model_config_json", "tmvec_prot_t5_name", "tmvec_device", "tmvec_freeze", "tmvec_use_half"]:
+                value = getattr(self, name)
+                default_value = type(self).__dataclass_fields__[name].default
+                if value != default_value and value is not None:
+                    deprecated_tmvec_runtime_args.append(f"{name}={value}")
+            if deprecated_tmvec_runtime_args:
+                warnings.warn(
+                    "TM-Vec runtime encoder arguments are now deprecated. TM-Vec is now offline-only during training. "
+                    f"These args will be ignored: {', '.join(deprecated_tmvec_runtime_args)}",
+                    UserWarning,
+                )
+            if self.tmvec_distill_weight < 0:
+                raise ValueError("tmvec_distill_weight must be >= 0")
+            if self.tmvec_weight < 0:
+                raise ValueError("tmvec_weight must be >= 0")
+
+        if self.triplet_microbatch_size < 0:
+            raise ValueError("triplet_microbatch_size must be >= 0")
+        if self.length_bucket_size_multiplier < 1:
+            raise ValueError("length_bucket_size_multiplier must be >= 1")
+        if self.max_tokens_per_batch < 0:
+            raise ValueError("max_tokens_per_batch must be >= 0")
 
         if self.deepspeed:
             # - must be run very last in arg parsing, since it will use a lot of these settings.
@@ -228,6 +358,14 @@ class KMAETrainingArguments(TrainingArguments):
         )
         return warmup_steps
 
+    @property
+    def global_structure_weight(self) -> float:
+        return self.tmvec_weight
+
+    @property
+    def global_structure_temperature(self) -> float:
+        return self.tmvec_temperature
+
     def get_lm_warmup_steps(self, num_training_steps: int):
         """
         Get number of steps used for a linear warmup on LM.
@@ -251,7 +389,7 @@ class DataArguments:
         metadata={"help": "Whether or not to model protein sequence data."}
     )
     model_protein_go_data: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether or not to model triplet data of `Protein-Go`"}
     )
     model_go_go_data: bool = field(
@@ -285,6 +423,71 @@ class DataArguments:
         metadata={"help": "Whether or not to save data into memory during sampling"}
     )
 
+    tmvec_triplets_tsv: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the explicit triplet TSV for global structure supervision."}
+    )
+
+    tmvec_pairs_tsv: Optional[str] = field(
+        default=None,
+        metadata={"help": "Deprecated pair TSV path. Still accepted for the older TMVecLoss path."}
+    )
+
+    tmvec_pairs_emb_npy: Optional[str] = field(
+        default=None,
+        metadata={"help": "Deprecated pair-order teacher embedding NPY for TMVecLoss."}
+    )
+
+    protein_seq_sample_limit: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional limit on number of protein sequence examples loaded."}
+    )
+
+    coordinates_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to pickled AlphaFold alpha-carbon coordinates."}
+    )
+
+    coordinates_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional directory of sharded per-anchor coordinate files (.npy/.pkl). Use instead of coordinates_path to avoid loading the full coordinate PKL into RAM."}
+    )
+
+    coordinate_cache_size: int = field(
+        default=128,
+        metadata={"help": "Number of recently used coordinate shards to keep cached in RAM when coordinates_dir is used. 0 disables caching."}
+    )
+
+    aa_vec_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to the mol2vec model used for amino-acid molecular encodings."}
+    )
+
+    aa_vec_vocab_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to a tiny precomputed amino-acid vocab file (.pkl/.json/.npy). Use instead of aa_vec_model_path to avoid loading the full mol2vec model at training startup."}
+    )
+
+    filter_triplets_to_coordinate_coverage: bool = field(
+        default=False,
+        metadata={"help": "If true, drop triplet rows whose anchor_id is missing from the coordinate PKL instead of failing."}
+    )
+
+    filtered_triplets_output_tsv: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to save the filtered triplet TSV actually used for training."}
+    )
+
+    min_triplet_retention_ratio: float = field(
+        default=0.0,
+        metadata={"help": "Abort if filtering triplets by coordinate coverage retains less than this fraction of rows."}
+    )
+
+    triplet_filter_report_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to write a JSON report about triplet filtering by coordinate coverage."}
+    )
+
     # negative sampling
     negative_sampling_fn: str = field(
         default="simple_random",
@@ -309,7 +512,7 @@ class DataArguments:
 
     # max length of protein sequence and Go term description
     max_protein_seq_length: int = field(
-        default=None,
+        default=1024,
         metadata={"help": "Maximum length of protein sequence."}
     )
     max_text_seq_length: int = field(

@@ -4,7 +4,7 @@ from torch._C import dtype
 from transformers import PreTrainedTokenizerBase
 from typing import List, Dict, Optional, Tuple
 import numpy as np
-from src.dataset import ProteinGoInputFeatures, GoGoInputFeatures, ProteinSeqInputFeatures
+from src.dataset import ProteinGoInputFeatures, GoGoInputFeatures, ProteinSeqInputFeatures, ProteinSeqPairInputFeatures, ProteinSeqTripletInputFeatures
 import random
 
 
@@ -16,8 +16,12 @@ def _collate_batch_for_protein_seq(
     are_protein_length_same: bool
 ):  
     # import ipdb;ipdb.set_trace()
-    if isinstance(examples[0], ProteinSeqInputFeatures):
+    if isinstance(examples[0], (ProteinSeqInputFeatures, ProteinSeqPairInputFeatures)):
         examples = [torch.tensor(e.input_ids, dtype=torch.long) for e in examples]
+    elif isinstance(examples[0], ProteinSeqTripletInputFeatures):
+        raise ValueError('ProteinSeqTripletInputFeatures should be collated via anchor/positive/negative fields')
+    elif isinstance(examples[0], dict) and 'input_ids' in examples[0]:
+        examples = [torch.tensor(e['input_ids'], dtype=torch.long) for e in examples]
 
     if are_protein_length_same:
         return torch.stack(examples, dim=0)
@@ -37,23 +41,22 @@ def _collate_batch_for_protein_cor(
         are_protein_length_same: bool
 ):
     if isinstance(examples[0], ProteinGoInputFeatures):
-        examples = [torch.tensor(e.coordinates, dtype=torch.float) for e in examples]
+        examples = [torch.as_tensor(np.asarray(e.coordinates, dtype=np.float32)) for e in examples]
+    elif isinstance(examples[0], ProteinSeqTripletInputFeatures):
+        examples = [torch.from_numpy(np.asarray(e.anchor_coordinates, dtype=np.float32)) for e in examples]
+    elif isinstance(examples[0], dict) and 'coordinates' in examples[0]:
+        examples = [torch.as_tensor(np.asarray(e['coordinates'], dtype=np.float32)) for e in examples]
 
     if are_protein_length_same:
         return torch.stack(examples, dim=0)
 
     max_length = max(x.size(0) for x in examples)
-    result = np.full((len(examples),max_length, 3),float('-inf'))
+    result = torch.full((len(examples), max_length, 3), float('-inf'), dtype=torch.float32)
     for i, example in enumerate(examples):
         if tokenizer.padding_side == 'right':
-            result[i][:example.size(0)] = example
+            result[i, :example.size(0)] = example
         else:
-            result[i][-example.size(0):] = example
-
-
-    result = torch.tensor(result, dtype=torch.float)
-
-
+            result[i, -example.size(0):] = example
     return result
 
 
@@ -63,27 +66,23 @@ def _collate_batch_for_aa_vec(
         are_protein_length_same: bool
 ):
     if isinstance(examples[0], ProteinGoInputFeatures):
-        examples = [torch.tensor(np.array(e.aa_vec), dtype=torch.float) for e in examples]
-
-
+        examples = [torch.as_tensor(np.asarray(e.aa_vec, dtype=np.float32)) for e in examples]
+    elif isinstance(examples[0], ProteinSeqTripletInputFeatures):
+        examples = [torch.from_numpy(np.asarray(e.anchor_aa_vec, dtype=np.float32)) for e in examples]
+    elif isinstance(examples[0], dict) and 'aa_vec' in examples[0]:
+        examples = [torch.as_tensor(np.asarray(e['aa_vec'], dtype=np.float32)) for e in examples]
 
     if are_protein_length_same:
         return torch.stack(examples, dim=0)
 
+    feature_dim = int(examples[0].size(-1)) if examples else 0
     max_length = max(x.size(0) for x in examples)
-    result = np.full((len(examples),max_length, 300),float(0))
- 
+    result = torch.zeros((len(examples), max_length, feature_dim), dtype=torch.float32)
     for i, example in enumerate(examples):
         if tokenizer.padding_side == 'right':
-            result[i][:example.size(0)] = example
+            result[i, :example.size(0)] = example
         else:
-            result[i][-example.size(0):] = example
-
-    
-
-    result = torch.tensor(result, dtype=torch.float)
-
-
+            result[i, -example.size(0):] = example
     return result
 
 
@@ -512,10 +511,89 @@ class DataCollatorForLanguageModeling:
     ) -> Dict[str, torch.Tensor]:
         # example here is a list of ProteinSeqInputFeatures
 
+        if hasattr(examples[0], 'anchor_input_ids'):
+            anchor_input_ids = _collate_batch_for_protein_seq([
+                {'input_ids': getattr(e, 'anchor_input_ids')} for e in examples
+            ], self.tokenizer, self.are_protein_length_same)
+            positive_input_ids = _collate_batch_for_protein_seq([
+                {'input_ids': getattr(e, 'positive_input_ids')} for e in examples
+            ], self.tokenizer, self.are_protein_length_same)
+            negative_input_ids = _collate_batch_for_protein_seq([
+                {'input_ids': getattr(e, 'negative_input_ids')} for e in examples
+            ], self.tokenizer, self.are_protein_length_same)
+            batch = {
+                'input_ids': anchor_input_ids,
+                'anchor_input_ids': anchor_input_ids,
+                'positive_input_ids': positive_input_ids,
+                'negative_input_ids': negative_input_ids,
+                'anchor_attention_mask': (anchor_input_ids != self.tokenizer.pad_token_id).long(),
+                'positive_attention_mask': (positive_input_ids != self.tokenizer.pad_token_id).long(),
+                'negative_attention_mask': (negative_input_ids != self.tokenizer.pad_token_id).long(),
+                'anchor_token_type_ids': torch.zeros_like(anchor_input_ids, dtype=torch.long),
+                'positive_token_type_ids': torch.zeros_like(positive_input_ids, dtype=torch.long),
+                'negative_token_type_ids': torch.zeros_like(negative_input_ids, dtype=torch.long),
+                'anchor_sequence': [getattr(e, 'anchor_sequence') for e in examples],
+                'positive_sequence': [getattr(e, 'positive_sequence') for e in examples],
+                'negative_sequence': [getattr(e, 'negative_sequence') for e in examples],
+            }
+            if hasattr(examples[0], 'anchor_id'):
+                batch['anchor_id'] = [getattr(e, 'anchor_id') for e in examples]
+                batch['positive_id'] = [getattr(e, 'positive_id') for e in examples]
+                batch['negative_id'] = [getattr(e, 'negative_id') for e in examples]
+            if hasattr(examples[0], 'positive_score') and getattr(examples[0], 'positive_score') is not None:
+                batch['positive_score'] = torch.tensor([getattr(e, 'positive_score') for e in examples], dtype=torch.float32)
+            if hasattr(examples[0], 'negative_score') and getattr(examples[0], 'negative_score') is not None:
+                batch['negative_score'] = torch.tensor([getattr(e, 'negative_score') for e in examples], dtype=torch.float32)
+            special_tokens_mask = None
+            if hasattr(examples[0], 'anchor_coordinates') and getattr(examples[0], 'anchor_coordinates') is not None:
+                batch['coordinates'] = _collate_batch_for_protein_cor(examples, self.tokenizer, self.are_protein_length_same)
+            if hasattr(examples[0], 'anchor_aa_vec') and getattr(examples[0], 'anchor_aa_vec') is not None:
+                batch['aa_vec'] = _collate_batch_for_aa_vec(examples, self.tokenizer, self.are_protein_length_same)
+            if self.mlm:
+                batch['input_ids'], batch['labels'] = self.mask_tokens(batch['input_ids'], special_tokens_mask=special_tokens_mask)
+                batch['anchor_input_ids'] = batch['input_ids']
+                batch['anchor_attention_mask'] = (batch['anchor_input_ids'] != self.tokenizer.pad_token_id).long()
+            else:
+                labels = batch['input_ids'].clone()
+                if self.tokenizer.pad_token_id is not None:
+                    labels[labels == self.tokenizer.pad_token_id] = -100
+                batch['labels'] = labels
+            batch['attention_mask'] = batch['anchor_attention_mask']
+            batch['token_type_ids'] = batch['anchor_token_type_ids']
+            if 'aa_vec' in batch:
+                batch['aa_vec_attention_mask'] = batch['anchor_attention_mask'][:, 1:-1].contiguous()
+            return batch
+
         batch = {'input_ids': _collate_batch_for_protein_seq(examples, self.tokenizer, self.are_protein_length_same)}
+
+        if hasattr(examples[0], 'sequence'):
+            batch['sequence'] = [getattr(e, 'sequence') for e in examples]
+
         # protein_coordinates
-        batch['protein_coordinates'] = _collate_batch_for_protein_cor(examples, self.tokenizer, self.are_protein_length_same)
-        batch['aa_vec'] = _collate_batch_for_aa_vec(examples, self.tokenizer, self.are_protein_length_same)
+        # batch['protein_coordinates'] = _collate_batch_for_protein_cor(examples, self.tokenizer, self.are_protein_length_same)
+        # batch['aa_vec'] = _collate_batch_for_aa_vec(examples, self.tokenizer, self.are_protein_length_same)
+        
+        if hasattr(examples[0], 'pair_id'):
+            batch['pair_id'] = torch.tensor([getattr(e, 'pair_id') for e in examples], dtype=torch.long)
+        if hasattr(examples[0], 'view_id'):
+            batch['view_id'] = torch.tensor([getattr(e, 'view_id') for e in examples], dtype=torch.long)
+
+        if 'pair_id' in batch and 'view_id' in batch:
+            pair_ids = batch['pair_id'].tolist()
+            view_ids = batch['view_id'].tolist()
+            counts = {}
+            for pid, vid in zip(pair_ids, view_ids):
+                counts.setdefault(pid, set()).add(vid)
+            bad = [pid for pid, vids in counts.items() if len(vids) != len(set(vids)) or len(vids) < 2]
+            if bad:
+                raise ValueError(f"pair_ids do not contain both views exactly once: {bad[:5]}")
+
+        # Use precomputed TM-Vec embeddings if available as optional teacher targets.
+        if hasattr(examples[0], 'tmvec_emb') and getattr(examples[0], 'tmvec_emb') is not None:
+            batch['tmvec_emb'] = torch.tensor([e.tmvec_emb for e in examples], dtype=torch.float32)
+            if 'pair_id' in batch and batch['tmvec_emb'].shape[0] != batch['pair_id'].shape[0]:
+                raise ValueError("tmvec_emb batch dimension must match pair_id batch dimension")
+
         special_tokens_mask = batch.pop('special_tokens_mask', None)
         if self.mlm:
             batch['input_ids'], batch['labels'] = self.mask_tokens(
@@ -528,8 +606,8 @@ class DataCollatorForLanguageModeling:
             batch['labels'] = labels
 
         batch['attention_mask'] = (batch['input_ids'] != self.tokenizer.pad_token_id).long()
-        batch['coordinate_attention_mask'] = batch['attention_mask']
-        batch['aa_vec_attention_mask'] = batch['attention_mask']
+        # batch['coordinate_attention_mask'] = batch['attention_mask']
+        # batch['aa_vec_attention_mask'] = batch['attention_mask']
         batch['token_type_ids'] = torch.zeros_like(batch['input_ids'], dtype=torch.long)
 
 

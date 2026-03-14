@@ -13,7 +13,7 @@ def _ensure_local_module_path() -> None:
     current_dir = Path(__file__).resolve().parent
     candidate_dirs = [
         current_dir,
-        current_dir.parent / 'src_refactor',
+        current_dir.parent / 'src',
     ]
     for candidate in candidate_dirs:
         if candidate.is_dir() and str(candidate) not in sys.path:

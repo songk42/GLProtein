@@ -64,7 +64,7 @@ tar -xvf data/pretrain_data/swissprot_pdb_v6.tar -C data/pretrain_data/alphafold
 Run the following to construct `aa_vocab.pkl` in `/data/pretrain_data`:
 
 ```bash
-python scripts_refactor/prepare_memory_assets.py \
+python script/prepare_memory_assets.py \
   --aa_vec_model_path data/pretrain_data/model_300dim.pkl \
   --aa_vec_vocab_out data/pretrain_data/aa_vocab.pkl
 ```
@@ -76,7 +76,7 @@ python scripts_refactor/prepare_memory_assets.py \
 Run the following to construct `tmvec_triplets_small.tsv` in `/data/pretrain_data`:
 
 ```bash
-python scripts_refactor/generate_tmvec_pairs_tsv.py \
+python script/generate_tmvec_pairs_tsv.py \
   --swiss_fasta data/pretrain_data/swissprot_seq.fasta \
   --swiss_tmvec_emb_npy data/pretrain_data/swiss_large.npy \
   --out_tsv data/pretrain_data/tmvec_triplets_small.tsv \
@@ -99,7 +99,7 @@ python scripts_refactor/generate_tmvec_pairs_tsv.py \
 Run the following to construct coordinate shards in `/data/pretrain_data/coordinates_small`:
 
 ```bash
-python scripts_refactor/extract_ca_coords.py \
+python script/extract_ca_coords.py \
   --input-dir data/pretrain_data/alphafold \
   --output data/pretrain_data/coordinates_small \
   --output-format sharded \
@@ -150,7 +150,7 @@ python run_pretrain_refactor.py \
 Run the following to construct `tmvec_triplets_full.tsv` in `/data/pretrain_data`:
 
 ```bash
-python scripts_refactor/generate_tmvec_pairs_tsv.py \
+python script/generate_tmvec_pairs_tsv.py \
   --swiss_fasta data/pretrain_data/swissprot_seq.fasta \
   --swiss_tmvec_emb_npy data/pretrain_data/swiss_large.npy \
   --out_tsv data/pretrain_data/tmvec_triplets_full.tsv \
@@ -175,7 +175,7 @@ Checkpoints are saved during training. If interrupted, make sure `--resume` is i
 Run the following to construct coordinate shards in `/data/pretrain_data/coordinates_full`:
 
 ```bash
-python scripts_refactor/extract_ca_coords.py \
+python script/extract_ca_coords.py \
   --input-dir data/pretrain_data/alphafold \
   --output data/pretrain_data/coordinates_full \
   --output-format sharded \
